@@ -1,0 +1,23 @@
+[package]
+name = "akc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes-gcm = { version = "0.10.3", features = ["zeroize"] }
+anyhow = "1"
+argon2 = { version = "0.5", features = ["std", "zeroize"] }
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+zeroize = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -137,7 +137,7 @@ mod tests {
     fn temp_path() -> std::path::PathBuf {
         let dir = std::env::temp_dir();
         dir.join(format!(
-            "keychain-test-{}-{}.kc",
+            "akc-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

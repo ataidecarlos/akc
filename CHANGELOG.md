@@ -5,6 +5,22 @@ All notable changes to akc are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-19
+
+### Added
+
+- `upgrade` command: check for and install updates from GitHub releases
+  - Checksum verification (SHA256) before replacing binary
+  - Confirmation prompt (skip with `--yes`)
+  - Force upgrade with `--force`
+  - Upgrade to specific version with `--version <VER>` (supports downgrade and pre-release)
+- Checksums published with each release (`checksums.txt`)
+- Cross-platform upgrade: automatically detects OS and architecture
+
+### Fixed
+
+- `--password` option now visible in `akc --help` (was only in subcommand help)
+
 ## [1.0.1] - 2026-09-19
 
 ### Added

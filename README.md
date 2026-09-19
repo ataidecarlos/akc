@@ -43,9 +43,21 @@ akc set secrets.akc api_key sk-123    # add or update
 akc get secrets.akc api_key           # print value
 akc list secrets.akc                  # list key names only
 akc delete secrets.akc api_key
+akc upgrade                           # check for updates
 ```
 
 Add `--password <pw>` to any command for non-interactive use (otherwise you are prompted with hidden input).
+
+### Upgrade
+
+```powershell
+akc upgrade                           # check for and install updates
+akc upgrade --yes                     # skip confirmation prompt
+akc upgrade --force                   # force upgrade even if already on latest
+akc upgrade --version 1.0.0           # upgrade to a specific version
+```
+
+Each release includes a `checksums.txt` file with SHA256 hashes for verifying binary integrity.
 
 ## Security
 

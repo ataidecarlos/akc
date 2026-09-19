@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 
 mod crypto;
 mod password;
 mod storage;
+mod upgrade;
 
 use password::read_password;
 use storage::Keychain;
@@ -17,15 +18,12 @@ use storage::Keychain;
     about = "Minimal encrypted keychain (akc): a single portable file holding key/value secrets"
 )]
 struct Cli {
+    /// Password (use only for scripts; prompts interactively when omitted)
+    #[arg(long, global = true, value_name = "PASSWORD")]
+    password: Option<String>,
+
     #[command(subcommand)]
     command: Command,
-}
-
-#[derive(Args)]
-struct PasswordArg {
-    /// Password (use only for scripts; prompts interactively when omitted)
-    #[arg(long, value_name = "PASSWORD")]
-    password: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -34,8 +32,6 @@ enum Command {
     Init {
         /// Path of the keychain file to create
         file: PathBuf,
-        #[command(flatten)]
-        pw: PasswordArg,
     },
     /// Add or update a secret
     Set {
@@ -45,8 +41,6 @@ enum Command {
         key: String,
         /// Secret value
         value: String,
-        #[command(flatten)]
-        pw: PasswordArg,
     },
     /// Print one secret to stdout
     Get {
@@ -54,15 +48,11 @@ enum Command {
         file: PathBuf,
         /// Name of the secret
         key: String,
-        #[command(flatten)]
-        pw: PasswordArg,
     },
     /// List secret names (values are never shown)
     List {
         /// Path of the keychain file
         file: PathBuf,
-        #[command(flatten)]
-        pw: PasswordArg,
     },
     /// Remove a secret
     Delete {
@@ -70,8 +60,18 @@ enum Command {
         file: PathBuf,
         /// Name of the secret
         key: String,
-        #[command(flatten)]
-        pw: PasswordArg,
+    },
+    /// Check for and install updates from GitHub releases
+    Upgrade {
+        /// Force upgrade even if already on latest version
+        #[arg(long)]
+        force: bool,
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Specify a particular version to upgrade to (e.g., "1.0.2" or "v1.0.2")
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
     },
 }
 
@@ -84,17 +84,19 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let password = cli.password.as_deref();
+
     match &cli.command {
-        Command::Init { file, pw } => cmd_init(file, pw.password.as_deref()),
+        Command::Init { file } => cmd_init(file, password),
         Command::Set {
             file,
             key,
             value,
-            pw,
-        } => cmd_set(file, key, value, pw.password.as_deref()),
-        Command::Get { file, key, pw } => cmd_get(file, key, pw.password.as_deref()),
-        Command::List { file, pw } => cmd_list(file, pw.password.as_deref()),
-        Command::Delete { file, key, pw } => cmd_delete(file, key, pw.password.as_deref()),
+        } => cmd_set(file, key, value, password),
+        Command::Get { file, key } => cmd_get(file, key, password),
+        Command::List { file } => cmd_list(file, password),
+        Command::Delete { file, key } => cmd_delete(file, key, password),
+        Command::Upgrade { force, yes, version } => cmd_upgrade(*force, *yes, version.as_deref()),
     }
 }
 
@@ -138,4 +140,8 @@ fn cmd_delete(file: &std::path::Path, key: &str, provided: Option<&str>) -> Resu
     ensure!(kc.delete(key), "key not found: {key}");
     kc.save(file, &password, false)?;
     Ok(())
+}
+
+fn cmd_upgrade(force: bool, yes: bool, version: Option<&str>) -> Result<()> {
+    upgrade::run(force, yes, version)
 }

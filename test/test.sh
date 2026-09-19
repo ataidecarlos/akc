@@ -3,7 +3,7 @@
 # Run from the project root: ./test/test.sh
 # Exit code 0 = all passed, 1 = one or more failures.
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -24,7 +24,9 @@ done
 
 if [[ -z "$AKC" ]]; then
     echo "No build found; running cargo build --release..."
+    set +e
     cargo build --release
+    set -e
     if [[ $? -ne 0 ]]; then
         echo "FAIL: build"
         exit 1
@@ -65,14 +67,12 @@ assert_true() {
 
 run_akc() {
     local pw="test-pass-123"
-    local tmpfile
-    tmpfile=$(mktemp)
-    if [[ "${1:-}" == "--password" ]]; then
-        pw="$2"
-        shift 2
-    fi
+    if [[ "${1:-}" == "--password" ]]; then pw="$2"; shift 2; fi
+    local tmpfile; tmpfile=$(mktemp)
+    set +e
     "$AKC" "$@" --password "$pw" > "$tmpfile" 2>&1
     EXIT_CODE=$?
+    set -e
     AKC_OUTPUT=$(cat "$tmpfile")
     rm -f "$tmpfile"
 }

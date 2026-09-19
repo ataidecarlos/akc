@@ -9,24 +9,26 @@ A minimal encrypted secret store. CLI only: no server or network listener. Singl
 
 ## Installation
 
-### Download Pre-built Binary
+### Download and Install
 
-Download the latest release from [releases/latest/](releases/latest/):
+Download the latest release from [releases/latest/](releases/latest/), then place the binary in a directory on your `PATH`.
 
 **Windows:**
-- `akc.exe` — Windows x64
+```powershell
+# Download akc.exe from releases/latest/
+Copy-Item akc.exe "$env:USERPROFILE\.local\bin\akc.exe"
+akc --version
+```
 
 **Linux:**
-- `akc-x86_64` — Linux x86_64 (static, musl)
-- `akc-arm64` — Linux ARM64 (static, musl)
+```bash
+# Download akc-x86_64 (or akc-arm64) from releases/latest/
+chmod +x akc-x86_64
+sudo mv akc-x86_64 /usr/local/bin/akc
+akc --version
+```
 
 Or browse all releases in [releases/](releases/).
-
-**Linux setup:**
-```bash
-chmod +x akc-x86_64  # or akc-arm64
-./akc-x86_64 --help
-```
 
 ### Build from Source
 

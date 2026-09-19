@@ -1,9 +1,9 @@
-# Post-build feature tests for akc. Run from the project root: .\test.ps1
-# Builds the release binary, then exercises every command against a temp file.
+# Post-build feature tests for akc.
+# Run from the project root: .\test\test.ps1
 # Exit code 0 = all passed, 1 = one or more failures.
 
 $ErrorActionPreference = "Stop"
-Set-Location -LiteralPath $PSScriptRoot
+Set-Location -LiteralPath (Join-Path $PSScriptRoot "..")
 
 $exe = @("target\release\akc.exe", "target/release/akc", "target\debug\akc.exe", "target/debug/akc") |
     Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1

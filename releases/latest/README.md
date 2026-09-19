@@ -1,5 +1,10 @@
 # Latest Release
 
-This folder always contains the most recent stable release of akc.
+This folder contains the most recent stable release of akc.
 
-For version history and detailed release notes, see the versioned folders (e.g., `v1.0.0/`).
+**Binaries:**
+- `akc.exe` — Windows x64
+- `akc-x86_64` — Linux x86_64 (static, musl)
+- `akc-arm64` — Linux ARM64 (static, musl)
+
+For version history and detailed release notes, see the versioned folders.

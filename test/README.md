@@ -9,7 +9,7 @@ akc uses a two-tier testing approach:
    - Storage: file I/O, atomic writes, data format
    - Password: interactive prompts, confirmation, validation
 
-2. **Integration tests** (`test\test.ps1`) — End-to-end CLI behavior
+2. **Integration tests** (`test/test.ps1` or `test/test.sh`) — End-to-end CLI behavior
    - All 5 commands (`init`, `set`, `get`, `list`, `delete`)
    - Error cases (wrong password, missing keys, empty password)
    - Security (tamper detection, GCM authentication)
@@ -24,6 +24,7 @@ akc uses a two-tier testing approach:
 
 ## Running Tests
 
+**Windows (PowerShell):**
 ```powershell
 # Unit tests (15 tests)
 cargo test
@@ -32,7 +33,20 @@ cargo test
 .\test\test.ps1
 ```
 
-Both must pass before any release.
+**Linux (PowerShell Core or Bash):**
+```bash
+# Unit tests (15 tests)
+cargo test
+
+# Integration tests - PowerShell Core
+pwsh test/test.ps1
+
+# Integration tests - Bash
+chmod +x test/test.sh
+./test/test.sh
+```
+
+Both unit and integration tests must pass before any release.
 
 ## What's Tested
 

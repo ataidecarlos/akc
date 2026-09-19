@@ -1,4 +1,4 @@
-# akc v1.0.0
+# akc — 20260919_1
 
 **Release Date:** 2026-09-19
 
@@ -22,9 +22,14 @@ Initial release of akc — a minimal encrypted secret store.
 - `init` refuses to overwrite existing files
 - Secret material zeroized from memory
 
-## Platform
+## Platforms
 
-- Windows x64
+**Windows:**
+- `akc.exe` — Windows x64
+
+**Linux:**
+- `akc-x86_64` — Linux x86_64 (static, musl)
+- `akc-arm64` — Linux ARM64 (static, musl)
 
 ## Usage
 
@@ -37,3 +42,9 @@ akc delete secrets.akc api_key
 ```
 
 Add `--password <pw>` for non-interactive use.
+
+**Linux setup:**
+```bash
+chmod +x akc-x86_64  # or akc-arm64
+./akc-x86_64 --help
+```

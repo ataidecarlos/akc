@@ -46,71 +46,71 @@ try {
     $kc = Join-Path $work "secrets.akc"
 
     # --- init ---
-    $r = Invoke-Akc @("init", $kc)
+    $r = Invoke-Akc @($kc, "init")
     Assert-True "init creates file" ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath $kc)) $r.Output
 
     $size = (Get-Item -LiteralPath $kc).Length
     Assert-True "init file is small binary" ($size -gt 40 -and $size -lt 200) "size=$size"
 
-    $r = Invoke-Akc @("init", $kc)
-    Assert-True "init refuses existing file" ($r.ExitCode -ne 0) $r.Output
+    $r = Invoke-Akc @($kc, "init")
+    Assert-True "init backs up existing file" ($r.ExitCode -eq 0 -and $r.Output -match "Backed up") $r.Output
 
-    $r = Invoke-Akc @("init", $kc, "x") -Password ""
+    $r = Invoke-Akc @($kc, "init", "x") -Password ""
     Assert-True "init rejects empty password" ($r.ExitCode -ne 0) $r.Output
 
     # --- set ---
-    $r = Invoke-Akc @("set", $kc, "zeta", "last-value")
+    $r = Invoke-Akc @($kc, "set", "zeta", "last-value")
     Assert-True "set adds secret" ($r.ExitCode -eq 0) $r.Output
-    $r = Invoke-Akc @("set", $kc, "alpha", "first-value")
+    $r = Invoke-Akc @($kc, "set", "alpha", "first-value")
     Assert-True "set adds second secret" ($r.ExitCode -eq 0) $r.Output
-    $r = Invoke-Akc @("set", $kc, "alpha", "updated-value")
+    $r = Invoke-Akc @($kc, "set", "alpha", "updated-value")
     Assert-True "set updates existing secret" ($r.ExitCode -eq 0) $r.Output
 
     # --- get ---
-    $r = Invoke-Akc @("get", $kc, "alpha")
+    $r = Invoke-Akc @($kc, "get", "alpha")
     Assert-True "get returns value" ($r.ExitCode -eq 0 -and $r.Output -eq "updated-value") $r.Output
 
-    $r = Invoke-Akc @("get", $kc, "missing")
+    $r = Invoke-Akc @($kc, "get", "missing")
     Assert-True "get missing key fails" ($r.ExitCode -ne 0 -and $r.Output -match "not found") $r.Output
 
     # --- list ---
-    $r = Invoke-Akc @("list", $kc)
+    $r = Invoke-Akc @($kc, "list")
     $lines = $r.Output -split "`r?`n"
     Assert-True "list shows sorted keys" ($r.ExitCode -eq 0 -and $lines[0] -eq "alpha" -and $lines[1] -eq "zeta" -and $lines.Count -eq 2) $r.Output
 
     # --- delete ---
-    $r = Invoke-Akc @("delete", $kc, "zeta")
+    $r = Invoke-Akc @($kc, "delete", "zeta")
     Assert-True "delete removes key" ($r.ExitCode -eq 0) $r.Output
-    $r = Invoke-Akc @("get", $kc, "zeta")
+    $r = Invoke-Akc @($kc, "get", "zeta")
     Assert-True "deleted key is gone" ($r.ExitCode -ne 0) $r.Output
-    $r = Invoke-Akc @("delete", $kc, "zeta")
+    $r = Invoke-Akc @($kc, "delete", "zeta")
     Assert-True "delete missing key fails" ($r.ExitCode -ne 0 -and $r.Output -match "not found") $r.Output
 
     # --- wrong password ---
-    $r = Invoke-Akc @("get", $kc, "alpha") -Password "wrong-pass"
+    $r = Invoke-Akc @($kc, "get", "alpha") -Password "wrong-pass"
     Assert-True "wrong password fails" ($r.ExitCode -ne 0 -and $r.Output -match "wrong password") $r.Output
-    $r = Invoke-Akc @("list", $kc) -Password "wrong-pass"
+    $r = Invoke-Akc @($kc, "list") -Password "wrong-pass"
     Assert-True "wrong password list fails" ($r.ExitCode -ne 0) $r.Output
-    $r = Invoke-Akc @("set", $kc, "evil", "x") -Password "wrong-pass"
+    $r = Invoke-Akc @($kc, "set", "evil", "x") -Password "wrong-pass"
     Assert-True "wrong password set fails" ($r.ExitCode -ne 0) $r.Output
 
     # --- portability ---
     $copy = Join-Path $work "copied.akc"
     Copy-Item -LiteralPath $kc -Destination $copy
-    $r = Invoke-Akc @("get", $copy, "alpha")
+    $r = Invoke-Akc @($copy, "get", "alpha")
     Assert-True "copied file still works" ($r.ExitCode -eq 0 -and $r.Output -eq "updated-value") $r.Output
 
     # --- tamper detection ---
     $bytes = [System.IO.File]::ReadAllBytes($copy)
     $bytes[$bytes.Length - 1] = $bytes[$bytes.Length - 1] -bxor 0xFF
     [System.IO.File]::WriteAllBytes($copy, $bytes)
-    $r = Invoke-Akc @("get", $copy, "alpha")
+    $r = Invoke-Akc @($copy, "get", "alpha")
     Assert-True "tampered file rejected" ($r.ExitCode -ne 0) $r.Output
 
     # --- persistence across runs is implied; verify file unchanged after failed ops ---
     $before = (Get-Item -LiteralPath $kc).Length
-    $null = Invoke-Akc @("get", $kc, "missing")
-    $null = Invoke-Akc @("delete", $kc, "missing")
+    $null = Invoke-Akc @($kc, "get", "missing")
+    $null = Invoke-Akc @($kc, "delete", "missing")
     $after = (Get-Item -LiteralPath $kc).Length
     Assert-True "failed ops leave file untouched" ($before -eq $after) "$before -> $after"
 }

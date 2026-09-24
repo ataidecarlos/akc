@@ -40,15 +40,28 @@ cargo build --release
 ## Usage
 
 ```powershell
-akc init secrets.akc                  # prompts for password (twice)
-akc set secrets.akc api_key sk-123    # add or update
-akc get secrets.akc api_key           # print value
-akc list secrets.akc                  # list key names only
-akc delete secrets.akc api_key
+akc secrets.akc init                  # prompts for password (twice)
+akc secrets.akc set api_key sk-123    # add or update
+akc secrets.akc get api_key           # print value
+akc secrets.akc list                  # list key names only
+akc secrets.akc delete api_key
 akc upgrade                           # check for updates
 ```
 
-Add `--password <pw>` to any command for non-interactive use (otherwise you are prompted with hidden input).
+Add `--password <pw>` or set `AKC_PASSWORD` for non-interactive use (otherwise you are prompted with hidden input).
+
+Run `akc secrets.akc` without a command to enter interactive mode. The password is requested once, then commands can be run repeatedly:
+
+```text
+akc> list
+akc> get api_key
+akc> set another_key another-value
+akc> delete another_key
+akc> init
+akc> exit
+```
+
+Interactive `init` and CLI `init` back up an existing keychain to `<keychain>_<YYYYMMDD_HHMMSS>.bak` before replacing it.
 
 ### Upgrade
 
@@ -64,7 +77,7 @@ Each release includes a `checksums.txt` file with SHA256 hashes for verifying bi
 ## Security
 
 - Wrong password fails via GCM authentication; truncated or tampered files are rejected.
-- Writes go to a temp file in the same directory, then atomically replace the target (`init` refuses to overwrite an existing file).
+- Writes go to a temp file in the same directory, then atomically replace the target. Re-initialization backs up the existing file first.
 - Secret material is zeroized from memory when dropped.
 - An empty data file is ~107 bytes.
 

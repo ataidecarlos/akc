@@ -1,13 +1,14 @@
 [package]
 name = "akc"
-version = "1.1.0"
+version = "2.0.0"
 edition = "2024"
 
 [dependencies]
 aes-gcm = { version = "0.10.3", features = ["zeroize"] }
 anyhow = "1"
 argon2 = { version = "0.5", features = ["std", "zeroize"] }
-clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"
 rand = "0.8"
 reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }

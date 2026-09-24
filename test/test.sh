@@ -83,81 +83,93 @@ KC="$WORK/secrets.akc"
 trap 'rm -rf "$WORK"' EXIT
 
 # --- init ---
-run_akc init "$KC"
+run_akc "$KC" init
 assert_true "init creates file" "$([[ $EXIT_CODE -eq 0 && -f "$KC" ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
 SIZE=$(stat -c%s "$KC" 2>/dev/null || stat -f%z "$KC" 2>/dev/null)
 assert_true "init file is small binary" "$([[ $SIZE -gt 40 && $SIZE -lt 200 ]] && echo 0 || echo 1)" "size=$SIZE"
 
-run_akc init "$KC"
-assert_true "init refuses existing file" "$([[ $EXIT_CODE -ne 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
+run_akc "$KC" init
+assert_true "init backs up existing file" "$([[ $EXIT_CODE -eq 0 && "$AKC_OUTPUT" == *"Backed up"* ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
-run_akc --password "" init "$KC" "x"
+run_akc --password "" "$KC" init "x"
 assert_true "init rejects empty password" "$([[ $EXIT_CODE -ne 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
 # --- set ---
-run_akc set "$KC" zeta "last-value"
+run_akc "$KC" set zeta "last-value"
 assert_true "set adds secret" "$([[ $EXIT_CODE -eq 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
-run_akc set "$KC" alpha "first-value"
+run_akc "$KC" set alpha "first-value"
 assert_true "set adds second secret" "$([[ $EXIT_CODE -eq 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
-run_akc set "$KC" alpha "updated-value"
+run_akc "$KC" set alpha "updated-value"
 assert_true "set updates existing secret" "$([[ $EXIT_CODE -eq 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
 # --- get ---
-run_akc get "$KC" alpha
+run_akc "$KC" get alpha
 assert_true "get returns value" "$([[ $EXIT_CODE -eq 0 && "$AKC_OUTPUT" == "updated-value" ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
-run_akc get "$KC" missing
+run_akc "$KC" get missing
 assert_true "get missing key fails" "$([[ $EXIT_CODE -ne 0 && "$AKC_OUTPUT" == *"not found"* ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
 # --- list ---
-run_akc list "$KC"
+run_akc "$KC" list
 LINE_COUNT=$(echo "$AKC_OUTPUT" | wc -l)
 FIRST=$(echo "$AKC_OUTPUT" | head -1)
 SECOND=$(echo "$AKC_OUTPUT" | tail -1)
 assert_true "list shows sorted keys" "$([[ $EXIT_CODE -eq 0 && "$FIRST" == "alpha" && "$SECOND" == "zeta" && $LINE_COUNT -eq 2 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
 # --- delete ---
-run_akc delete "$KC" zeta
+run_akc "$KC" delete zeta
 assert_true "delete removes key" "$([[ $EXIT_CODE -eq 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
-run_akc get "$KC" zeta
+run_akc "$KC" get zeta
 assert_true "deleted key is gone" "$([[ $EXIT_CODE -ne 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
-run_akc delete "$KC" zeta
+run_akc "$KC" delete zeta
 assert_true "delete missing key fails" "$([[ $EXIT_CODE -ne 0 && "$AKC_OUTPUT" == *"not found"* ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
 # --- wrong password ---
-run_akc --password "wrong-pass" get "$KC" alpha
+run_akc --password "wrong-pass" "$KC" get alpha
 assert_true "wrong password fails" "$([[ $EXIT_CODE -ne 0 && "$AKC_OUTPUT" == *"wrong password"* ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
-run_akc --password "wrong-pass" list "$KC"
+run_akc --password "wrong-pass" "$KC" list
 assert_true "wrong password list fails" "$([[ $EXIT_CODE -ne 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
-run_akc --password "wrong-pass" set "$KC" evil "x"
+run_akc --password "wrong-pass" "$KC" set evil "x"
 assert_true "wrong password set fails" "$([[ $EXIT_CODE -ne 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
 # --- portability ---
 COPY="$WORK/copied.akc"
 cp "$KC" "$COPY"
-run_akc get "$COPY" alpha
+run_akc "$COPY" get alpha
 assert_true "copied file still works" "$([[ $EXIT_CODE -eq 0 && "$AKC_OUTPUT" == "updated-value" ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
 # --- tamper detection ---
 LAST_BYTE=$(xxd -p -l 1 -s -1 "$COPY")
 LAST_BYTE_XOR=$(printf '%02x' $((0x$LAST_BYTE ^ 0xFF)))
 printf "\\x$LAST_BYTE_XOR" | dd of="$COPY" bs=1 seek=$(($(stat -c%s "$COPY") - 1)) count=1 conv=notrunc 2>/dev/null
-run_akc get "$COPY" alpha
+run_akc "$COPY" get alpha
 assert_true "tampered file rejected" "$([[ $EXIT_CODE -ne 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
 # --- failed ops leave file untouched ---
 BEFORE=$(stat -c%s "$KC" 2>/dev/null || stat -f%z "$KC" 2>/dev/null)
-run_akc get "$KC" missing
-run_akc delete "$KC" missing
+run_akc "$KC" get missing
+run_akc "$KC" delete missing
 AFTER=$(stat -c%s "$KC" 2>/dev/null || stat -f%z "$KC" 2>/dev/null)
 assert_true "failed ops leave file untouched" "$([[ $BEFORE -eq $AFTER ]] && echo 0 || echo 1)" "$BEFORE -> $AFTER"
+
+# --- environment password ---
+AKC_PASSWORD="test-pass-123" "$AKC" "$KC" get alpha > "$WORK/env-output" 2>&1
+ENV_EXIT=$?
+ENV_OUTPUT=$(cat "$WORK/env-output")
+assert_true "password environment variable works" "$([[ $ENV_EXIT -eq 0 && "$ENV_OUTPUT" == "updated-value" ]] && echo 0 || echo 1)" "$ENV_OUTPUT"
+
+# --- interactive mode ---
+printf 'set interactive interactive-value\nget interactive\nexit\n' |
+    AKC_PASSWORD="test-pass-123" "$AKC" "$KC" > "$WORK/interactive-output" 2>&1
+INTERACTIVE_OUTPUT=$(cat "$WORK/interactive-output")
+assert_true "interactive mode runs multiple commands" "$([[ "$INTERACTIVE_OUTPUT" == *"interactive-value"* ]] && echo 0 || echo 1)" "$INTERACTIVE_OUTPUT"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

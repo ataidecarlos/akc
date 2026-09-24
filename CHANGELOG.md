@@ -5,6 +5,19 @@ All notable changes to akc are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-09-23
+
+### Added
+
+- Interactive mode with `get`, `set`, `list`, `delete`, `init`, `help`, and `exit` commands
+- `AKC_PASSWORD` environment variable
+- Backups before re-initializing an existing keychain
+
+### Changed
+
+- Breaking CLI syntax change: keychain path now comes immediately after `akc`
+- Existing keychains are backed up as `<keychain>_<YYYYMMDD_HHMMSS>.bak` before `init` replaces them
+
 ## [1.1.0] - 2026-09-19
 
 ### Added

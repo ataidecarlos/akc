@@ -51,7 +51,7 @@ Both unit and integration tests must pass before any release.
 ## What's Tested
 
 **Commands:**
-- `init` — creates file, refuses overwrite, rejects empty password
+- `init` — creates file, backs up existing files, rejects empty password
 - `set` — adds new secrets, updates existing
 - `get` — retrieves values, fails on missing keys
 - `list` — shows sorted keys

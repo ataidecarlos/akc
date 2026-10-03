@@ -1,16 +1,27 @@
 use anyhow::{Context, Result, ensure};
 use zeroize::Zeroizing;
 
+/// Read a password from the console, using `provided` if it is set.
+///
+/// `confirm` only applies when the password is typed interactively: a password
+/// supplied via `--password` or `AKC_PASSWORD` has already been entered once by
+/// whoever set it, so asking for it twice would break scripted use.
 pub fn read_password(provided: Option<String>, confirm: bool) -> Result<Zeroizing<String>> {
-    read_with(provided, confirm, |prompt| {
-        rpassword::prompt_password(prompt).context("failed to read password")
-    })
+    read_with(provided, confirm, &mut console_prompt)
 }
 
-fn read_with(
+/// The real terminal prompt, exposed so callers that take an injectable prompt
+/// can still reach the console.
+pub(crate) fn console_prompt(prompt: &str) -> Result<String> {
+    rpassword::prompt_password(prompt).context("failed to read password")
+}
+
+/// Password reader with an injectable prompt, so callers that are not attached
+/// to a terminal (notably interactive mode) can drive it in tests.
+pub(crate) fn read_with(
     provided: Option<String>,
     confirm: bool,
-    mut prompt: impl FnMut(&str) -> Result<String>,
+    prompt: &mut dyn FnMut(&str) -> Result<String>,
 ) -> Result<Zeroizing<String>> {
     let interactive = provided.is_none();
     let password = Zeroizing::new(match provided {
@@ -31,18 +42,19 @@ mod tests {
 
     #[test]
     fn supplied_password_preserves_whitespace_without_prompting() {
-        let password = read_with(Some(" pass ".into()), true, |_| panic!()).unwrap();
+        let mut panic_if_prompted = |_: &str| -> Result<String> { panic!("should not prompt") };
+        let password = read_with(Some(" pass ".into()), true, &mut panic_if_prompted).unwrap();
         assert_eq!(password.as_str(), " pass ");
     }
 
     #[test]
     fn interactive_confirmation() {
         let mut calls = 0;
-        let password = read_with(None, true, |_| {
+        let mut prompt = |_: &str| {
             calls += 1;
             Ok(" pass ".into())
-        })
-        .unwrap();
+        };
+        let password = read_with(None, true, &mut prompt).unwrap();
         assert_eq!(password.as_str(), " pass ");
         assert_eq!(calls, 2);
     }
@@ -50,23 +62,36 @@ mod tests {
     #[test]
     fn mismatched_confirmation_is_rejected() {
         let mut answers = ["first", "second"].into_iter();
-        assert!(read_with(None, true, |_| Ok(answers.next().unwrap().into())).is_err());
+        let mut prompt = |_: &str| Ok(answers.next().unwrap().to_string());
+        assert!(read_with(None, true, &mut prompt).is_err());
     }
 
     #[test]
     fn empty_and_failed_input_are_rejected() {
-        assert!(read_with(Some(String::new()), false, |_| panic!()).is_err());
-        assert!(read_with(None, false, |_| anyhow::bail!("no terminal")).is_err());
+        let mut panic_if_prompted = |_: &str| -> Result<String> { panic!("should not prompt") };
+        assert!(read_with(Some(String::new()), false, &mut panic_if_prompted).is_err());
+
+        let mut failing = |_: &str| anyhow::bail!("no terminal");
+        assert!(read_with(None, false, &mut failing).is_err());
     }
 
     #[test]
     fn existing_password_only_prompts_once() {
         let mut calls = 0;
-        read_with(None, false, |_| {
+        let mut prompt = |_: &str| {
             calls += 1;
             Ok("password".into())
-        })
-        .unwrap();
+        };
+        read_with(None, false, &mut prompt).unwrap();
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn whitespace_only_password_is_accepted() {
+        // Trailing/leading spaces are legitimate password material and must not
+        // be trimmed away by the reader.
+        let mut prompt = |_: &str| Ok("  ".to_string());
+        let password = read_with(None, false, &mut prompt).unwrap();
+        assert_eq!(password.as_str(), "  ");
     }
 }

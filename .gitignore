@@ -1,1 +1,5 @@
 /target
+
+# Keychain backups written by `akc init` next to the vault. These contain real
+# secrets in the clear-encrypted vault form and should never be committed.
+*.bak

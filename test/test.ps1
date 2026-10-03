@@ -15,6 +15,50 @@ if (-not $exe) {
         Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 }
 
+function Invoke-AkcEnv {
+    param([string[]]$AkcArgs, [string]$Password = "test-pass-123")
+    $ErrorActionPreference = "Continue"
+    $previous = $env:AKC_PASSWORD
+    $env:AKC_PASSWORD = $Password
+    try {
+        $output = & $exe @AkcArgs 2>&1 | Out-String
+        $code = $LASTEXITCODE
+    }
+    finally {
+        if ($null -eq $previous) { Remove-Item Env:\AKC_PASSWORD -ErrorAction SilentlyContinue }
+        else { $env:AKC_PASSWORD = $previous }
+    }
+    [pscustomobject]@{ ExitCode = $code; Output = $output.Trim() }
+}
+
+# Drive interactive mode from a script, with a hard timeout. A command that
+# blocks on a console password prompt must fail the run instead of hanging it.
+function Invoke-AkcInteractive {
+    param(
+        [string[]]$AkcArgs,
+        [string]$Script,
+        [string]$Password = "test-pass-123",
+        [int]$TimeoutSec = 45
+    )
+    $job = Start-Job -ScriptBlock {
+        param($exePath, $akcArgs, $stdinText, $pw)
+        $env:AKC_PASSWORD = $pw
+        $out = $stdinText | & $exePath @akcArgs 2>&1 | Out-String
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out.Trim() }
+    } -ArgumentList $exe, $AkcArgs, $Script, $Password
+
+    if (Wait-Job $job -Timeout $TimeoutSec) {
+        $result = Receive-Job $job
+        Remove-Job $job -Force
+        $result
+    }
+    else {
+        Stop-Job $job
+        Remove-Job $job -Force
+        [pscustomobject]@{ ExitCode = -1; Output = "TIMED OUT after ${TimeoutSec}s (interactive mode hung)" }
+    }
+}
+
 $script:pass = 0
 $script:fail = 0
 
@@ -53,7 +97,11 @@ try {
     Assert-True "init file is small binary" ($size -gt 40 -and $size -lt 200) "size=$size"
 
     $r = Invoke-Akc @($kc, "init")
-    Assert-True "init backs up existing file" ($r.ExitCode -eq 0 -and $r.Output -match "Backed up") $r.Output
+    Assert-True "init refuses an existing keychain" ($r.ExitCode -ne 0 -and $r.Output -match "already exists") $r.Output
+    Assert-True "init refusal points at change-password" ($r.Output -match "change-password") $r.Output
+
+    $r = Invoke-Akc @($kc, "init", "--force")
+    Assert-True "init --force replaces and backs up" ($r.ExitCode -eq 0 -and $r.Output -match "Backed up") $r.Output
 
     $r = Invoke-Akc @($kc, "init", "x") -Password ""
     Assert-True "init rejects empty password" ($r.ExitCode -ne 0) $r.Output
@@ -66,6 +114,21 @@ try {
     $r = Invoke-Akc @($kc, "set", "alpha", "updated-value")
     Assert-True "set updates existing secret" ($r.ExitCode -eq 0) $r.Output
 
+    # --- value normalization ---
+    $r = Invoke-Akc @($kc, "set", "padded", "  padded-value  ")
+    Assert-True "set strips padding from values" ($r.ExitCode -eq 0) $r.Output
+    $r = Invoke-Akc @($kc, "get", "padded")
+    Assert-True "stored value has no padding" ($r.ExitCode -eq 0 -and $r.Output -eq "padded-value") $r.Output
+
+    $r = Invoke-Akc @($kc, "set", "blank", "")
+    Assert-True "set rejects an empty value" ($r.ExitCode -ne 0 -and $r.Output -match "must not be empty") $r.Output
+    $r = Invoke-Akc @($kc, "set", "blank", "   ")
+    Assert-True "set rejects a whitespace-only value" ($r.ExitCode -ne 0) $r.Output
+    $r = Invoke-Akc @($kc, "get", "blank")
+    Assert-True "rejected value was not stored" ($r.ExitCode -ne 0) $r.Output
+    $r = Invoke-Akc @($kc, "set", "blank", "   ")
+    Assert-True "empty-value error explains the rule" ($r.Output -match "whitespace is removed") $r.Output
+
     # --- get ---
     $r = Invoke-Akc @($kc, "get", "alpha")
     Assert-True "get returns value" ($r.ExitCode -eq 0 -and $r.Output -eq "updated-value") $r.Output
@@ -76,7 +139,7 @@ try {
     # --- list ---
     $r = Invoke-Akc @($kc, "list")
     $lines = $r.Output -split "`r?`n"
-    Assert-True "list shows sorted keys" ($r.ExitCode -eq 0 -and $lines[0] -eq "alpha" -and $lines[1] -eq "zeta" -and $lines.Count -eq 2) $r.Output
+    Assert-True "list shows sorted keys" ($r.ExitCode -eq 0 -and $lines[0] -eq "alpha" -and $lines[1] -eq "padded" -and $lines[2] -eq "zeta" -and $lines.Count -eq 3) $r.Output
 
     # --- delete ---
     $r = Invoke-Akc @($kc, "delete", "zeta")
@@ -107,12 +170,70 @@ try {
     $r = Invoke-Akc @($copy, "get", "alpha")
     Assert-True "tampered file rejected" ($r.ExitCode -ne 0) $r.Output
 
-    # --- persistence across runs is implied; verify file unchanged after failed ops ---
-    $before = (Get-Item -LiteralPath $kc).Length
-    $null = Invoke-Akc @($kc, "get", "missing")
-    $null = Invoke-Akc @($kc, "delete", "missing")
-    $after = (Get-Item -LiteralPath $kc).Length
-    Assert-True "failed ops leave file untouched" ($before -eq $after) "$before -> $after"
+    # --- container format ---
+    $raw = [System.IO.File]::ReadAllBytes($kc)
+    $magic = [System.Text.Encoding]::ASCII.GetString($raw[0..7])
+    Assert-True "keychain starts with the AKCSTORE magic" ($magic -eq "AKCSTORE") "magic=$magic"
+    $version = [System.BitConverter]::ToUInt32($raw, 8)
+    Assert-True "keychain records container version 2" ($version -eq 2) "version=$version"
+
+    # --- environment password ---
+    $r = Invoke-AkcEnv @($kc, "get", "alpha")
+    Assert-True "AKC_PASSWORD environment variable works" ($r.ExitCode -eq 0 -and $r.Output -eq "updated-value") $r.Output
+
+    $r = Invoke-AkcEnv @($kc, "get", "alpha") -Password "wrong-pass"
+    Assert-True "AKC_PASSWORD wrong value fails" ($r.ExitCode -ne 0 -and $r.Output -match "wrong password") $r.Output
+
+    # --- interactive mode ---
+    $r = Invoke-AkcInteractive -AkcArgs @($kc) -Script "set from-interactive interactive-value`nget from-interactive`nlist`nexit`n"
+    Assert-True "interactive mode runs multiple commands" ($r.ExitCode -eq 0 -and $r.Output -match "interactive-value") $r.Output
+    Assert-True "interactive mode does not hang" ($r.ExitCode -ne -1) $r.Output
+
+    $r = Invoke-AkcEnv @($kc, "get", "from-interactive")
+    Assert-True "interactive set is persisted" ($r.ExitCode -eq 0 -and $r.Output -eq "interactive-value") $r.Output
+
+    $r = Invoke-AkcInteractive -AkcArgs @($kc) -Script "set ipad   padded-interactive  `nset iblank    `nexit`n"
+    Assert-True "interactive set strips padding" ($r.ExitCode -eq 0) $r.Output
+    Assert-True "interactive blank value is rejected with an explanation" ($r.Output -match "whitespace is removed") $r.Output
+    $r = Invoke-AkcEnv @($kc, "get", "ipad")
+    Assert-True "interactive stored value has no padding" ($r.ExitCode -eq 0 -and $r.Output -eq "padded-interactive") $r.Output
+    $r = Invoke-AkcEnv @($kc, "get", "iblank")
+    Assert-True "interactive rejects a blank value" ($r.ExitCode -ne 0) $r.Output
+
+    $r = Invoke-AkcInteractive -AkcArgs @($kc) -Script "init`nexit`n"
+    Assert-True "interactive init is no longer a command" ($r.ExitCode -eq 0 -and $r.Output -match "unknown command: init") $r.Output
+
+    # --- change-password ---
+    $before = (Get-ChildItem -LiteralPath $work -Filter "*.bak").Count
+
+    $r = Invoke-Akc @($kc, "change-password", "--new-password", "newpass-456") -Password "wrong-pass"
+    Assert-True "change-password rejects a wrong current password" ($r.ExitCode -ne 0 -and $r.Output -match "wrong password") $r.Output
+    $r = Invoke-Akc @($kc, "get", "alpha")
+    Assert-True "failed change-password leaves the vault readable" ($r.ExitCode -eq 0 -and $r.Output -eq "updated-value") $r.Output
+    Assert-True "failed change-password creates no backup" ((Get-ChildItem -LiteralPath $work -Filter "*.bak").Count -eq $before) "before=$before"
+
+    $r = Invoke-Akc @($kc, "change-password", "--new-password", "newpass-456")
+    Assert-True "change-password succeeds" ($r.ExitCode -eq 0 -and $r.Output -match "Changed the password") $r.Output
+
+    $r = Invoke-Akc @($kc, "get", "alpha") -Password "newpass-456"
+    Assert-True "secrets survive a password change" ($r.ExitCode -eq 0 -and $r.Output -eq "updated-value") $r.Output
+
+    $r = Invoke-Akc @($kc, "list")
+    Assert-True "old password no longer works" ($r.ExitCode -ne 0) $r.Output
+
+    Assert-True "change-password created a backup" ((Get-ChildItem -LiteralPath $work -Filter "*.bak").Count -eq $before + 1) "before=$before"
+
+    $r = Invoke-Akc @($kc, "change-password", "--new-password", "another-789") -Password "newpass-456"
+    Assert-True "password can be changed again" ($r.ExitCode -eq 0) $r.Output
+
+    # --- failed ops leave file untouched ---
+    $r = Invoke-Akc @($kc, "get", "alpha") -Password "newpass-456"
+    $sizeBefore = (Get-Item -LiteralPath $kc).Length
+    $null = Invoke-Akc @($kc, "get", "missing") -Password "newpass-456"
+    $null = Invoke-Akc @($kc, "delete", "missing") -Password "newpass-456"
+    $null = Invoke-Akc @($kc, "set", "blank", "") -Password "newpass-456"
+    $sizeAfter = (Get-Item -LiteralPath $kc).Length
+    Assert-True "failed ops leave file untouched" ($sizeBefore -eq $sizeAfter) "$sizeBefore -> $sizeAfter"
 }
 finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue

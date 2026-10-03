@@ -1,6 +1,7 @@
 # Latest Release
 
-This folder holds the most recent published release of akc.
+This folder mirrors the most recent published release of akc (**3.0.0**, 2026-10-04).
+It is kept identical to [`releases/20261004_1/`](../20261004_1/).
 
 **Binaries** (architecture-explicit — pick the one matching your machine):
 

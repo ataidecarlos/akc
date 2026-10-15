@@ -8,20 +8,37 @@
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath (Join-Path $PSScriptRoot "..")
 
-# The first candidate that exists AND runs here. Cross-built artifacts land under
-# target/ too, so presence alone is not enough to choose one.
-$candidates = @("target\release\akc.exe", "target/release/akc", "target\debug\akc.exe", "target/debug/akc")
-$exe = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Where-Object {
-    $null = & $_ --version 2>&1
-    $LASTEXITCODE -eq 0
-} | Select-Object -First 1
-if (-not $exe) {
-    Write-Host "No build found; running cargo build --release..."
-    cargo build --release
-    if ($LASTEXITCODE -ne 0) { Write-Host "FAIL: build"; exit 1 }
-    $exe = @("target\release\akc.exe", "target/release/akc") |
-        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+# Set AKC to test a specific build, e.g. a downloaded release asset:
+#   $env:AKC = "C:\downloads\akc-windows-x86_64.exe"; .\test\test.ps1
+$exe = $env:AKC
+if ($exe) {
+    if (-not (Test-Path -LiteralPath $exe)) {
+        Write-Host "FAIL: AKC=$exe does not exist"
+        exit 1
+    }
+    $null = & $exe --version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "FAIL: $exe cannot run on this host"
+        exit 1
+    }
+} else {
+    # The first candidate that exists AND runs here. Cross-built artifacts land
+    # under target/ too, so presence alone is not enough to choose one.
+    $candidates = @("target\release\akc.exe", "target/release/akc", "target\debug\akc.exe", "target/debug/akc")
+    $exe = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Where-Object {
+        $null = & $_ --version 2>&1
+        $LASTEXITCODE -eq 0
+    } | Select-Object -First 1
+    if (-not $exe) {
+        Write-Host "No build found; running cargo build --release..."
+        cargo build --release
+        if ($LASTEXITCODE -ne 0) { Write-Host "FAIL: build"; exit 1 }
+        $exe = @("target\release\akc.exe", "target/release/akc") |
+            Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    }
+    if (-not $exe) { Write-Host "FAIL: no binary found"; exit 1 }
 }
+Write-Host "Using binary: $exe"
 
 $script:pass = 0
 $script:fail = 0

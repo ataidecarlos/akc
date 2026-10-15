@@ -3,3 +3,16 @@
 # Keychain backups written by `akc init` next to the vault. These contain real
 # secrets in the clear-encrypted vault form and should never be committed.
 *.bak
+
+# Write locks akc keeps beside a vault so two writers cannot clobber each other.
+# Ephemeral, and never worth committing.
+*.lock
+
+# Local agent-tooling state: never part of the project.
+.claude-flow/
+.swarm/
+ruvector.db
+
+# Vera code-search index (local semantic search). Never commit the index.
+.vera/
+.vera.lock

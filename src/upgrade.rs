@@ -146,16 +146,27 @@ fn parse_release(response: &serde_json::Value, binary_name: &str) -> Result<Rele
 }
 
 /// Release asset name for the running platform.
+fn get_platform_binary_name() -> Result<String> {
+    asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Release asset name for a given platform.
 ///
 /// Asset names are architecture-explicit. A single generic `akc.exe` cannot
 /// serve both Windows architectures: the file would silently be the wrong one
 /// for half of them.
-fn get_platform_binary_name() -> Result<String> {
-    let asset = match (std::env::consts::OS, std::env::consts::ARCH) {
+///
+/// The platform is an argument rather than read from the host, so every
+/// published name can be checked from any machine -- including macOS, which akc
+/// does not publish for, and where reading the host's OS would only ever
+/// produce an error.
+fn asset_name_for(os: &str, arch: &str) -> Result<String> {
+    let asset = match (os, arch) {
         ("windows", "x86_64") => "akc-windows-x86_64.exe",
         ("windows", "aarch64") => "akc-windows-aarch64.exe",
         ("linux", "x86_64") => "akc-linux-x86_64",
         ("linux", "aarch64") => "akc-linux-aarch64",
+        ("macos", "aarch64") => "akc-macos-aarch64",
         (os, arch) => {
             bail!("akc does not publish a binary for this platform (OS: {os}, arch: {arch})")
         }
@@ -275,18 +286,52 @@ fn replace_executable(binary_data: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Every published asset name carries both its OS and its architecture. A
+    /// generic name cannot distinguish the two Windows architectures, so the
+    /// file would silently be the wrong one for half of them.
+    ///
+    /// Driven from a table rather than the host's platform, so all four names
+    /// are checked wherever the tests run.
     #[test]
-    fn asset_name_is_architecture_explicit() {
-        let name = get_platform_binary_name().unwrap();
-        assert!(name.contains(std::env::consts::OS), "{name}");
-        // A generic name cannot distinguish Windows architectures, so the
-        // architecture must appear in the asset name.
-        if std::env::consts::OS == "windows" {
-            assert!(name.ends_with(".exe"), "{name}");
-            assert!(
-                name.contains("x86_64") || name.contains("aarch64"),
-                "windows asset name must be architecture-explicit: {name}"
-            );
+    fn every_asset_name_is_architecture_explicit() {
+        for (os, arch, expected) in [
+            ("windows", "x86_64", "akc-windows-x86_64.exe"),
+            ("windows", "aarch64", "akc-windows-aarch64.exe"),
+            ("linux", "x86_64", "akc-linux-x86_64"),
+            ("linux", "aarch64", "akc-linux-aarch64"),
+            ("macos", "aarch64", "akc-macos-aarch64"),
+        ] {
+            let name = asset_name_for(os, arch).unwrap();
+            assert_eq!(name, expected);
+            assert!(name.contains(os), "{name} must name its OS");
+            assert!(name.contains(arch), "{name} must name its architecture");
+        }
+    }
+
+    /// A platform akc does not publish for gets a clear error, not a name that
+    /// would 404 on download. Intel Macs are the real case: the macOS asset is
+    /// Apple Silicon only, so an x86_64 Mac must fall through to this rather
+    /// than download an arm64 binary it cannot run.
+    #[test]
+    fn unsupported_platforms_are_rejected() {
+        for (os, arch) in [("macos", "x86_64"), ("freebsd", "x86_64")] {
+            let err = asset_name_for(os, arch).unwrap_err().to_string();
+            assert!(err.contains("does not publish"), "{err}");
+            assert!(err.contains(os), "{err}");
+            assert!(err.contains(arch), "{err}");
+        }
+    }
+
+    /// The host's own lookup either resolves to a name for this architecture or
+    /// reports the platform as unsupported. Both are correct; a panic is not.
+    #[test]
+    fn the_host_platform_resolves_or_is_reported_unsupported() {
+        match get_platform_binary_name() {
+            Ok(name) => assert!(
+                name.contains(std::env::consts::ARCH),
+                "{name} must name the host architecture"
+            ),
+            Err(err) => assert!(err.to_string().contains("does not publish"), "{err}"),
         }
     }
 

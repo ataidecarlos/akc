@@ -17,7 +17,7 @@ pub(crate) fn console_prompt(prompt: &str) -> Result<String> {
 }
 
 /// Password reader with an injectable prompt, so callers that are not attached
-/// to a terminal (notably interactive mode) can drive it in tests.
+/// to a terminal can still be driven from tests.
 pub(crate) fn read_with(
     provided: Option<String>,
     confirm: bool,

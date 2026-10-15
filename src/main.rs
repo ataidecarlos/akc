@@ -1,26 +1,40 @@
-use std::io::{BufRead, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result, bail, ensure};
+use clap::{ArgGroup, Parser};
 use zeroize::Zeroizing;
 
+mod config;
 mod crypto;
 mod password;
 mod storage;
 mod upgrade;
 
-use password::{console_prompt, read_password, read_with};
-use storage::Keychain;
+use config::{Config, default_key_file, read_key_file};
+use storage::{Keychain, Lock};
 
 #[derive(Parser)]
 #[command(
     name = "akc",
     version,
-    about = "Minimal encrypted keychain (akc): a single portable file holding key/value secrets"
+    about = "Minimal encrypted keychain (akc): fetch a secret from a single portable file",
+    group(ArgGroup::new("command").args(["init", "set", "delete", "list", "rotate", "update"]))
 )]
 struct Cli {
-    /// Password (use only for scripts; prompts interactively when omitted)
+    /// Secret name(s). With no command flag their values are printed.
+    #[arg(value_name = "NAME")]
+    names: Vec<String>,
+
+    /// Path of the keychain file (defaults to the config file)
+    #[arg(long, global = true, value_name = "PATH")]
+    keychain: Option<PathBuf>,
+
+    /// Path of the file holding the master key
+    #[arg(long, global = true, value_name = "PATH")]
+    key_file: Option<PathBuf>,
+
+    /// Master key as a literal value; prefer --key-file so it stays out of argv
     #[arg(
         long,
         global = true,
@@ -30,63 +44,62 @@ struct Cli {
     )]
     password: Option<String>,
 
-    /// Path of the keychain file
-    keychain: Option<PathBuf>,
+    /// Create an empty keychain
+    #[arg(long)]
+    init: bool,
 
-    #[command(subcommand)]
-    command: Option<Command>,
-}
+    /// Store NAME, overwriting it if present; reads the value from stdin when
+    /// no VALUE is given
+    ///
+    /// `Option<Option<_>>` is what distinguishes `--set` (read stdin) from
+    /// `--set ""` (an empty value, which is rejected).
+    #[arg(long, value_name = "VALUE", num_args = 0..=1)]
+    set: Option<Option<String>>,
 
-#[derive(Subcommand)]
-enum Command {
-    /// Create a new empty keychain file
-    Init {
-        /// Replace an existing keychain, discarding its secrets
-        #[arg(long)]
-        force: bool,
-    },
-    /// Change the password of an existing keychain
-    ChangePassword {
-        /// New password (prompts for it, and confirms it twice, when omitted)
-        #[arg(
-            long,
-            env = "AKC_NEW_PASSWORD",
-            hide_env_values = true,
-            value_name = "PASSWORD"
-        )]
-        new_password: Option<String>,
-    },
-    /// Add or update a secret
-    Set {
-        /// Name of the secret
-        key: String,
-        /// Secret value (surrounding whitespace is removed)
-        value: String,
-    },
-    /// Print one secret to stdout
-    Get {
-        /// Name of the secret
-        key: String,
-    },
-    /// List secret names (values are never shown)
-    List {},
-    /// Remove a secret
-    Delete {
-        /// Name of the secret
-        key: String,
-    },
-    /// Check for and install updates from GitHub releases
-    Upgrade {
-        /// Force upgrade even if already on latest version
-        #[arg(long)]
-        force: bool,
-        /// Skip confirmation prompt
-        #[arg(long, short = 'y')]
-        yes: bool,
-        /// Specify a particular version to upgrade to (e.g., "1.0.2" or "v1.0.2")
-        #[arg(long, value_name = "VERSION")]
-        version: Option<String>,
-    },
+    /// Remove NAME
+    #[arg(long, alias = "drop", alias = "remove", alias = "rm")]
+    delete: bool,
+
+    /// List secret names
+    #[arg(long)]
+    list: bool,
+
+    /// Re-key the keychain under a new master key, keeping every secret
+    #[arg(long)]
+    rotate: bool,
+
+    /// New master key file, for --rotate and --init
+    #[arg(long, value_name = "PATH")]
+    new_key_file: Option<PathBuf>,
+
+    /// New master key as a literal value, for --rotate and --init
+    #[arg(
+        long,
+        env = "AKC_NEW_PASSWORD",
+        hide_env_values = true,
+        value_name = "PASSWORD"
+    )]
+    new_password: Option<String>,
+
+    /// Print output as JSON
+    #[arg(long)]
+    json: bool,
+
+    /// Check for and install updates
+    #[arg(long)]
+    update: bool,
+
+    /// With --update or --init: proceed even though it discards something
+    #[arg(long)]
+    force: bool,
+
+    /// With --update: skip the confirmation prompt
+    #[arg(long, short = 'y')]
+    yes: bool,
+
+    /// With --update: install a specific version
+    #[arg(long, value_name = "VERSION")]
+    to: Option<String>,
 }
 
 fn main() {
@@ -98,135 +111,115 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let password = cli.password.as_deref();
+    let config = Config::load()?;
 
-    match &cli.command {
-        Some(Command::Upgrade {
-            force,
-            yes,
-            version,
-        }) => {
-            ensure!(
-                cli.keychain.is_none(),
-                "upgrade does not use a keychain file"
-            );
-            cmd_upgrade(*force, *yes, version.as_deref())
-        }
-        Some(command) => {
-            let file = cli.keychain.as_deref().context("keychain path required")?;
-            match command {
-                Command::Init { force } => cmd_init(file, *force, password),
-                Command::ChangePassword { new_password } => {
-                    cmd_change_password(file, password, new_password.as_deref())
-                }
-                Command::Set { key, value } => cmd_set(file, key, value, password),
-                Command::Get { key } => cmd_get(file, key, password),
-                Command::List {} => cmd_list(file, password),
-                Command::Delete { key } => cmd_delete(file, key, password),
-                Command::Upgrade { .. } => unreachable!(),
-            }
-        }
-        None => {
-            let file = cli
-                .keychain
+    if cli.update {
+        ensure!(cli.names.is_empty(), "--update does not take secret names");
+        return upgrade::run(cli.force, cli.yes, cli.to.as_deref());
+    }
+
+    let file = cli.keychain.clone().or(config.keychain.clone()).context(
+        "no keychain configured: set `keychain` in ~/.config/akc/config, or pass --keychain",
+    )?;
+
+    let key_file = cli
+        .key_file
+        .clone()
+        .or_else(|| std::env::var_os("AKC_KEY_FILE").map(PathBuf::from));
+
+    // `--init` only ever sets a key, so it must not be made to open the vault
+    // first -- that would prompt for a key that does not exist yet.
+    if cli.init {
+        ensure!(cli.names.is_empty(), "--init does not take secret names");
+        let replacement = resolve_new_key(
+            cli.new_password.as_deref().or(cli.password.as_deref()),
+            cli.new_key_file
                 .as_deref()
-                .context("keychain path required (or use 'akc upgrade')")?;
-            cmd_interactive(file, password)
-        }
-    }
-}
-
-/// Create a new keychain.
-///
-/// Refuses to touch an existing file unless `force` is given. `init` upserts a
-/// password, so the typed password is confirmed twice; `change-password` is the
-/// operation for re-keying a vault you already have.
-fn cmd_init(file: &Path, force: bool, provided: Option<&str>) -> Result<()> {
-    if file.exists() {
-        ensure!(
-            force,
-            "{} already exists: use 'akc {} change-password' to keep its secrets, \
-             or 'akc {} init --force' to discard them and start over",
-            file.display(),
-            file.display(),
-            file.display()
-        );
-        let backup = backup_path(file)?;
-        std::fs::copy(file, &backup).with_context(|| {
-            format!("cannot back up {} to {}", file.display(), backup.display())
-        })?;
-        println!("Backed up existing keychain to {}", backup.display());
+                .or(key_file.as_deref())
+                .or(config.key_file.as_deref()),
+        )?;
+        return cmd_init(&file, cli.force, &replacement);
     }
 
-    let password = read_new_password(provided, &mut console_prompt)?;
-    let kc = Keychain::new();
-    kc.save(file, &password, !force)
-        .with_context(|| format!("cannot create {}", file.display()))?;
-    println!("Created {}", file.display());
-    Ok(())
+    let password = resolve_key(cli.password.as_deref(), key_file.as_deref(), &config)?;
+
+    if cli.rotate {
+        ensure!(cli.names.is_empty(), "--rotate does not take secret names");
+        let replacement =
+            resolve_new_key(cli.new_password.as_deref(), cli.new_key_file.as_deref())?;
+        return cmd_rotate(&file, &password, &replacement);
+    }
+    if cli.list {
+        return cmd_list(&file, &password, &cli.names, cli.json);
+    }
+    if let Some(value) = cli.set.as_ref() {
+        let [name] = cli.names.as_slice() else {
+            bail!("--set takes exactly one NAME");
+        };
+        return cmd_set(&file, name, value.as_deref(), &password);
+    }
+    if cli.delete {
+        return cmd_delete(&file, &password, &cli.names);
+    }
+    cmd_get(&file, &password, &cli.names, cli.json)
 }
 
-/// Re-key an existing keychain, keeping every secret.
+/// Resolve the master key for opening an existing keychain.
 ///
-/// `current` is verified by loading the vault first, so a wrong password cannot
-/// get this far. The replacement is confirmed twice when typed. This is the only
-/// supported way to change a password without losing secrets; `init --force`
-/// discards them instead.
-///
-/// `password` is the current password (like every other command), while
-/// `new_password` is the replacement. Keeping them separate is what makes a
-/// non-interactive change possible at all.
-fn cmd_change_password(
-    file: &Path,
+/// Order: a literal password, then a key file, then the console. The key file
+/// is what lets an agent fetch a secret with no prompt and no environment
+/// setup, so it is checked before the console is considered at all.
+fn resolve_key(
     password: Option<&str>,
-    new_password: Option<&str>,
-) -> Result<()> {
-    ensure!(
-        file.exists(),
-        "keychain not found: {} (run 'akc {} init' first)",
-        file.display(),
-        file.display()
-    );
-
-    // Verifies the current password: a wrong one cannot decrypt the vault.
-    let current = read_password(password.map(str::to_string), false)?;
-    let kc = Keychain::load(file, &current)?;
-
-    let replacement = read_new_password(new_password, &mut console_prompt)?;
-    rekey(file, &kc, &replacement, &mut std::io::stdout())
-}
-
-/// Back up the vault, then rewrite it under `new_password`.
-///
-/// Split out so the CLI and the interactive session share one implementation.
-/// Output goes to `out` rather than straight to stdout, so the interactive
-/// session can capture it.
-fn rekey(file: &Path, kc: &Keychain, new_password: &str, out: &mut impl Write) -> Result<()> {
-    let backup = backup_path(file)?;
-    std::fs::copy(file, &backup)
-        .with_context(|| format!("cannot back up {} to {}", file.display(), backup.display()))?;
-    kc.save(file, new_password, false)?;
-    writeln!(out, "Backed up existing keychain to {}", backup.display())?;
-    writeln!(out, "Changed the password for {}", file.display())?;
-    Ok(())
-}
-
-/// Ask for a password that will become a keychain's key, confirming it.
-///
-/// Every action that upserts a password routes through here, so the double-entry
-/// guarantee cannot be quietly bypassed by a future command. Confirmation only
-/// applies to a typed password: one supplied via `--password`/`AKC_PASSWORD`
-/// cannot contain a typo, and asking twice would break scripted use.
-fn read_new_password(
-    provided: Option<&str>,
-    prompt: &mut dyn FnMut(&str) -> Result<String>,
+    key_file: Option<&Path>,
+    config: &Config,
 ) -> Result<Zeroizing<String>> {
-    read_with(provided.map(str::to_string), true, prompt)
+    if let Some(password) = password {
+        ensure!(!password.is_empty(), "password must not be empty");
+        return Ok(Zeroizing::new(password.to_string()));
+    }
+
+    // A named key file must exist. The default one is optional, so that a
+    // machine with nothing configured falls through to the prompt rather than
+    // failing with a confusing message about a file the user never mentioned.
+    if let Some(path) = key_file.or(config.key_file.as_deref()) {
+        ensure!(
+            path.exists(),
+            "key file not found: {} (set `key_file` in ~/.config/akc/config, or pass --key-file)",
+            path.display()
+        );
+        return read_key_file(path);
+    }
+    if let Some(path) = default_key_file()
+        && path.exists()
+    {
+        return read_key_file(&path);
+    }
+
+    password::read_password(None, false)
+}
+
+/// Resolve the replacement key for `--init` and `--rotate`.
+///
+/// A typed replacement is confirmed twice, because a typo here locks the
+/// secrets away behind a key nobody has. One supplied by flag, file or
+/// environment is used as-is: it cannot contain a typo, and asking twice would
+/// break scripted use.
+fn resolve_new_key(password: Option<&str>, key_file: Option<&Path>) -> Result<Zeroizing<String>> {
+    if let Some(password) = password {
+        ensure!(!password.is_empty(), "new password must not be empty");
+        return Ok(Zeroizing::new(password.to_string()));
+    }
+    if let Some(path) = key_file {
+        ensure!(path.exists(), "new key file not found: {}", path.display());
+        return read_key_file(path);
+    }
+    password::read_password(None, true)
 }
 
 /// Normalize a secret value.
 ///
-/// Surrounding whitespace is always removed, so `set k "  v  "` stores `v`.
+/// Surrounding whitespace is always removed, so `--set "  v  "` stores `v`.
 /// That makes a blank value meaningless, so it is rejected rather than stored.
 fn normalize_value(raw: &str) -> Result<String> {
     let value = raw.trim();
@@ -237,42 +230,168 @@ fn normalize_value(raw: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
-fn cmd_set(file: &Path, key: &str, value: &str, provided: Option<&str>) -> Result<()> {
-    let value = normalize_value(value)?;
-    let password = read_password(provided.map(str::to_string), false)?;
-    let mut kc = Keychain::load(file, &password)?;
-    kc.set(key, value);
-    kc.save(file, &password, false)?;
+/// Read a secret value without putting it on the command line.
+///
+/// A pipe is the agent path. A terminal gets a hidden prompt instead, because a
+/// value typed at a visible prompt would sit in the scrollback.
+fn read_value() -> Result<String> {
+    if std::io::stdin().is_terminal() {
+        return rpassword::prompt_password("Value: ").context("failed to read the value");
+    }
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_to_string(&mut raw)
+        .context("failed to read the value from stdin")?;
+    Ok(raw)
+}
+
+/// Apply `f` to the vault and save it, holding the vault's write lock.
+///
+/// The vault is reloaded inside the lock, so a write another process made since
+/// this one last read it is preserved rather than clobbered. `f` returning an
+/// error aborts before the save, leaving the file untouched.
+fn mutate(
+    file: &Path,
+    password: &str,
+    f: impl FnOnce(&mut Keychain) -> Result<()>,
+) -> Result<Keychain> {
+    let _lock = Lock::acquire(file)?;
+    let mut kc = Keychain::load(file, password)?;
+    f(&mut kc)?;
+    kc.save(file, password, false)?;
+    Ok(kc)
+}
+
+/// Create an empty keychain.
+///
+/// Refuses to touch an existing file unless `force` is given, so a mistyped
+/// path cannot quietly replace a vault you already had. `--rotate` is the
+/// operation for re-keying one you want to keep.
+fn cmd_init(file: &Path, force: bool, password: &str) -> Result<()> {
+    let _lock = Lock::acquire(file)?;
+    if file.exists() {
+        ensure!(
+            force,
+            "{} already exists: use --rotate to keep its secrets, \
+             or --init --force to discard them and start over",
+            file.display()
+        );
+        let backup = backup_path(file)?;
+        std::fs::copy(file, &backup).with_context(|| {
+            format!("cannot back up {} to {}", file.display(), backup.display())
+        })?;
+        println!("Backed up existing keychain to {}", backup.display());
+    }
+    Keychain::new().save(file, password, !force)?;
+    println!("Created {}", file.display());
     Ok(())
 }
 
-fn cmd_get(file: &std::path::Path, key: &str, provided: Option<&str>) -> Result<()> {
-    let password = read_password(provided.map(str::to_string), false)?;
-    let kc = Keychain::load(file, &password)?;
-    let value = kc.get(key).context(format!("key not found: {key}"))?;
-    println!("{value}");
+/// Re-key the keychain, keeping every secret.
+///
+/// The vault is one blob, so this is a single re-encrypt rather than a loop
+/// over secrets -- it costs the same whether the vault holds one key or a
+/// thousand. A wrong current key cannot decrypt, so it fails before anything is
+/// written, and the old file is backed up first.
+///
+/// Note what this cannot do: if the vault is committed to git, the old key
+/// still opens every commit made before the rotation.
+fn cmd_rotate(file: &Path, current: &str, replacement: &str) -> Result<()> {
+    ensure!(file.exists(), "keychain not found: {}", file.display());
+    let _lock = Lock::acquire(file)?;
+    let kc = Keychain::load(file, current)?;
+    rekey(file, &kc, replacement, &mut std::io::stdout())
+}
+
+/// Back up the vault, then rewrite it under `new_password`.
+fn rekey(file: &Path, kc: &Keychain, new_password: &str, out: &mut impl Write) -> Result<()> {
+    let backup = backup_path(file)?;
+    std::fs::copy(file, &backup)
+        .with_context(|| format!("cannot back up {} to {}", file.display(), backup.display()))?;
+    kc.save(file, new_password, false)?;
+    writeln!(out, "Backed up existing keychain to {}", backup.display())?;
+    writeln!(out, "Rotated the master key for {}", file.display())?;
     Ok(())
 }
 
-fn cmd_list(file: &std::path::Path, provided: Option<&str>) -> Result<()> {
-    let password = read_password(provided.map(str::to_string), false)?;
-    let kc = Keychain::load(file, &password)?;
-    for key in kc.keys() {
-        println!("{key}");
+/// Store a secret. `value` is `None` when the flag was given with nothing after
+/// it, which is the signal to read the secret from stdin instead of argv.
+fn cmd_set(file: &Path, name: &str, value: Option<&str>, password: &str) -> Result<()> {
+    let raw = match value {
+        Some(value) => value.to_string(),
+        None => read_value()?,
+    };
+    let value = normalize_value(&raw)?;
+    mutate(file, password, |kc| {
+        kc.set(name, value);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn cmd_get(file: &Path, password: &str, names: &[String], json: bool) -> Result<()> {
+    ensure!(!names.is_empty(), "no secret name given");
+    let kc = Keychain::load(file, password)?;
+
+    // Every name is resolved before anything is printed, so a missing one
+    // cannot leave half a result on stdout for a caller to misread.
+    let mut values = Vec::with_capacity(names.len());
+    for name in names {
+        let value = kc
+            .get(name)
+            .with_context(|| format!("key not found: {name}"))?;
+        values.push((name.as_str(), value.as_str()));
+    }
+
+    if json {
+        let map: serde_json::Map<String, serde_json::Value> = values
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&map)?);
+    } else {
+        for (_, value) in values {
+            println!("{value}");
+        }
     }
     Ok(())
 }
 
-fn cmd_delete(file: &std::path::Path, key: &str, provided: Option<&str>) -> Result<()> {
-    let password = read_password(provided.map(str::to_string), false)?;
-    let mut kc = Keychain::load(file, &password)?;
-    ensure!(kc.delete(key), "key not found: {key}");
-    kc.save(file, &password, false)?;
+fn cmd_list(file: &Path, password: &str, names: &[String], json: bool) -> Result<()> {
+    let kc = Keychain::load(file, password)?;
+    let keys: Vec<&str> = if names.is_empty() {
+        kc.keys()
+    } else {
+        // Naming keys asks "which of these exist", so a missing one is simply
+        // absent rather than an error.
+        names
+            .iter()
+            .filter(|name| kc.get(name).is_some())
+            .map(String::as_str)
+            .collect()
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&keys)?);
+    } else {
+        for key in keys {
+            println!("{key}");
+        }
+    }
     Ok(())
 }
 
-fn cmd_upgrade(force: bool, yes: bool, version: Option<&str>) -> Result<()> {
-    upgrade::run(force, yes, version)
+/// Remove one or more secrets. All or nothing: if any name is missing, nothing
+/// is written.
+fn cmd_delete(file: &Path, password: &str, names: &[String]) -> Result<()> {
+    ensure!(!names.is_empty(), "no secret name given");
+    mutate(file, password, |kc| {
+        for name in names {
+            ensure!(kc.delete(name), "key not found: {name}");
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn backup_path(file: &Path) -> Result<PathBuf> {
@@ -290,163 +409,20 @@ fn backup_path(file: &Path) -> Result<PathBuf> {
     Ok(backup)
 }
 
-fn cmd_interactive(file: &Path, provided: Option<&str>) -> Result<()> {
-    ensure!(
-        file.exists(),
-        "keychain not found: {} (run 'akc {} init' first)",
-        file.display(),
-        file.display()
-    );
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
-    let mut output = std::io::stdout();
-    interactive_session(file, &mut input, &mut output, &mut console_prompt, provided)
-}
-
-const SET_USAGE: &str = "usage: set <key> <value> (a value is required: surrounding whitespace is \
-     removed, so a blank value is rejected)";
-
-const INTERACTIVE_HELP: &str =
-    "Commands: get <key>, set <key> <value>, list, delete <key>, change-password, help, exit";
-
-/// The interactive command loop.
-///
-/// Command input, the password prompt, and output are all injected so the
-/// session can be exercised without a terminal. `change-password` re-keys the
-/// vault, so the session password is rebound to the new one -- otherwise the
-/// next write would silently re-encrypt the file under the password the session
-/// started with.
-///
-/// There is no interactive `init`: interactive mode only ever runs against an
-/// existing keychain, and discarding its contents is a deliberate CLI-only act
-/// (`akc <file> init --force`).
-fn interactive_session(
-    file: &Path,
-    input: &mut impl BufRead,
-    out: &mut impl Write,
-    prompt: &mut dyn FnMut(&str) -> Result<String>,
-    provided: Option<&str>,
-) -> Result<()> {
-    let mut password = read_with(provided.map(str::to_string), false, prompt)?;
-    let mut kc = Keychain::load(file, &password)?;
-    let mut line = String::new();
-
-    writeln!(
-        out,
-        "Interactive mode. Type 'help' for commands, 'exit' to quit."
-    )?;
-
-    loop {
-        write!(out, "akc> ")?;
-        out.flush()?;
-        line.clear();
-        if input.read_line(&mut line)? == 0 {
-            break;
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (command, args) = line.split_once(' ').unwrap_or((line, ""));
-        let args = args.trim();
-        match command {
-            "help" | "?" => writeln!(out, "{INTERACTIVE_HELP}")?,
-            "exit" | "quit" => break,
-            "list" => {
-                if !args.is_empty() {
-                    writeln!(out, "usage: list")?;
-                    continue;
-                }
-                for key in kc.keys() {
-                    writeln!(out, "{key}")?;
-                }
-            }
-            "get" => match one_argument(args, "get <key>") {
-                Ok(key) => match kc.get(key) {
-                    Some(value) => writeln!(out, "{value}")?,
-                    None => writeln!(out, "error: key not found: {key}")?,
-                },
-                Err(message) => writeln!(out, "{message}")?,
-            },
-            "set" => match args.split_once(char::is_whitespace) {
-                Some((key, raw)) if !key.is_empty() => match normalize_value(raw) {
-                    Ok(value) => {
-                        kc.set(key, value);
-                        if let Err(err) = kc.save(file, &password, false) {
-                            writeln!(out, "error saving: {err:#}")?;
-                        }
-                    }
-                    Err(err) => writeln!(out, "error: {err:#}")?,
-                },
-                _ => writeln!(out, "{SET_USAGE}")?,
-            },
-            "delete" => match one_argument(args, "delete <key>") {
-                Ok(key) => {
-                    if kc.delete(key) {
-                        if let Err(err) = kc.save(file, &password, false) {
-                            writeln!(out, "error saving: {err:#}")?;
-                        }
-                    } else {
-                        writeln!(out, "error: key not found: {key}")?;
-                    }
-                }
-                Err(message) => writeln!(out, "{message}")?,
-            },
-            "change-password" => {
-                match interactive_change_password(file, &password, prompt, out) {
-                    // Adopt the new password for the rest of the session.
-                    Ok(new_password) => password = new_password,
-                    Err(err) => writeln!(out, "error: {err:#}")?,
-                }
-            }
-            _ => writeln!(out, "unknown command: {command}. Type 'help' for commands.")?,
-        }
-    }
-    Ok(())
-}
-
-fn one_argument<'a>(args: &'a str, usage: &str) -> Result<&'a str, String> {
-    if args.is_empty() || args.contains(char::is_whitespace) {
-        Err(format!("usage: {usage}"))
-    } else {
-        Ok(args)
-    }
-}
-
-/// Re-key `file` from inside a session, returning the new password so the caller
-/// can keep writing with it.
-///
-/// `current` is the session password, already verified when the session opened.
-/// The replacement is always typed and confirmed twice here: there is no
-/// subcommand in interactive mode to carry `--new-password`, and a script that
-/// needs to change a password should use `akc <file> change-password`.
-fn interactive_change_password(
-    file: &Path,
-    current: &str,
-    prompt: &mut dyn FnMut(&str) -> Result<String>,
-    out: &mut impl Write,
-) -> Result<Zeroizing<String>> {
-    let new_password = read_new_password(None, prompt)?;
-
-    // Load before touching anything, so a failure here cannot damage the vault.
-    let kc = Keychain::load(file, current)?;
-    rekey(file, &kc, &new_password, out)?;
-    Ok(new_password)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
+    /// Unique per call. A timestamp alone is not enough: two tests can start
+    /// inside the same clock tick, and sharing a directory means one test
+    /// reads another's vault.
     fn temp_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "akc-it-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -461,236 +437,6 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
-    }
-
-    /// Drive a whole interactive session from a scripted script and a scripted
-    /// sequence of password-prompt answers.
-    fn run_session(file: &Path, script: &str, answers: &[&str], provided: Option<&str>) -> String {
-        let mut queue = answers.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let mut prompted = 0usize;
-        let mut prompt = |_: &str| -> Result<String> {
-            prompted += 1;
-            Ok(queue.remove(0))
-        };
-        let mut out: Vec<u8> = Vec::new();
-        let mut input = std::io::Cursor::new(script.as_bytes().to_vec());
-        interactive_session(file, &mut input, &mut out, &mut prompt, provided).unwrap();
-        assert!(prompted <= answers.len());
-        String::from_utf8(out).unwrap()
-    }
-
-    fn prompts_used(answers: &[&str], script: &str, provided: Option<&str>) -> usize {
-        // Re-run counting prompts by inspecting how many answers were consumed.
-        let mut queue = answers.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let mut prompted = 0usize;
-        let mut prompt = |_: &str| -> Result<String> {
-            prompted += 1;
-            Ok(queue.remove(0))
-        };
-        let mut out: Vec<u8> = Vec::new();
-        let mut input = std::io::Cursor::new(script.as_bytes().to_vec());
-        let file = temp_dir().join("promptcount.akc");
-        let _ = interactive_session(&file, &mut input, &mut out, &mut prompt, provided);
-        prompted
-    }
-
-    #[test]
-    fn session_gets_and_sets_secrets() {
-        let dir = temp_dir();
-        let file = dir.join("s.akc");
-        let kc = Keychain::new();
-        kc.save(&file, "pw", false).unwrap();
-
-        let out = run_session(&file, "set a 1\nget a\nlist\nexit\n", &[], Some("pw"));
-        assert!(out.contains("1"), "{out}");
-        assert!(out.contains("a"), "{out}");
-
-        let reloaded = Keychain::load(&file, "pw").unwrap();
-        assert_eq!(reloaded.get("a").map(String::as_str), Some("1"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Regression: `change-password` re-keys the vault, and the session must keep
-    /// writing with the NEW password. Before the fix the session reused the
-    /// password it started with, silently reverting the change.
-    #[test]
-    fn change_password_then_set_persists_under_the_new_password() {
-        let dir = temp_dir();
-        let file = dir.join("s.akc");
-        let mut kc = Keychain::new();
-        kc.set("before", "old-value".to_string());
-        kc.save(&file, "oldpass", false).unwrap();
-
-        // Answers: session password, then the new password + confirmation.
-        run_session(
-            &file,
-            "change-password\nset after init-value\nexit\n",
-            &["oldpass", "newpass", "newpass"],
-            None,
-        );
-
-        let reloaded = Keychain::load(&file, "newpass").unwrap();
-        assert_eq!(
-            reloaded.get("after").map(String::as_str),
-            Some("init-value")
-        );
-        // change-password keeps secrets; unlike init it must not wipe them.
-        assert_eq!(
-            reloaded.get("before").map(String::as_str),
-            Some("old-value")
-        );
-        // And the old password must no longer work.
-        assert!(Keychain::load(&file, "oldpass").is_err());
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-    /// Interactive mode has no subcommand to carry `--new-password`, so the
-    /// replacement is always typed and confirmed twice -- even when
-    /// `AKC_PASSWORD` is set for the session. The scripted path is
-    /// `akc <file> change-password --new-password`.
-    #[test]
-    fn interactive_change_password_always_confirms_the_new_password() {
-        let dir = temp_dir();
-        let file = dir.join("s.akc");
-        Keychain::new().save(&file, "pw", false).unwrap();
-
-        // Answers: the new password and its confirmation. An empty answer list
-        // panics if the prompt is reached fewer times than expected, and a
-        // leftover answer is caught by run_session.
-        let out = run_session(
-            &file,
-            "change-password\nset beta b\nexit\n",
-            &["newpw", "newpw"],
-            Some("pw"),
-        );
-        assert!(out.contains("Changed the password"), "{out}");
-
-        let reloaded = Keychain::load(&file, "newpw").unwrap();
-        assert_eq!(reloaded.get("beta").map(String::as_str), Some("b"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn cli_change_password_needs_no_terminal_when_new_password_is_given() {
-        let dir = temp_dir();
-        let file = dir.join("s.akc");
-        let mut kc = Keychain::new();
-        kc.set("keep", "me".to_string());
-        kc.save(&file, "oldpass", false).unwrap();
-
-        // Both passwords supplied: this must not prompt at all, so a run that
-        // reached the console would fail under a non-interactive caller.
-        cmd_change_password(&file, Some("oldpass"), Some("newpass")).unwrap();
-
-        let reloaded = Keychain::load(&file, "newpass").unwrap();
-        assert_eq!(reloaded.get("keep").map(String::as_str), Some("me"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn session_password_prompts_exactly_once() {
-        let dir = temp_dir();
-        let file = dir.join("s.akc");
-        Keychain::new().save(&file, "pw", false).unwrap();
-        // No `--password`: the session must ask once, and must not ask again
-        // per command.
-        let prompts = prompts_used(&["pw"], "list\nexit\n", None);
-        assert_eq!(prompts, 1);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn change_password_backs_up_the_existing_keychain() {
-        let dir = temp_dir();
-        let file = dir.join("s.akc");
-        let mut kc = Keychain::new();
-        kc.set("keep", "me".to_string());
-        kc.save(&file, "oldpass", false).unwrap();
-
-        let out = run_session(
-            &file,
-            "change-password\nexit\n",
-            &["oldpass", "new", "new"],
-            None,
-        );
-        assert!(out.contains("Backed up"), "{out}");
-
-        let backups: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".bak"))
-            .collect();
-        assert_eq!(backups.len(), 1, "{out}");
-        // The backup still holds the old contents under the old password.
-        let old = Keychain::load(&dir.join(&backups[0]), "oldpass").unwrap();
-        assert_eq!(old.get("keep").map(String::as_str), Some("me"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A mistyped confirmation must abort the change and leave the vault usable
-    /// on its original password.
-    #[test]
-    fn failed_change_password_keeps_the_session_usable() {
-        let dir = temp_dir();
-        let file = dir.join("s.akc");
-        let mut kc = Keychain::new();
-        kc.set("keep", "me".to_string());
-        kc.save(&file, "oldpass", false).unwrap();
-
-        let out = run_session(
-            &file,
-            "change-password\nlist\nexit\n",
-            &["oldpass", "typed", "different"],
-            None,
-        );
-        assert!(out.contains("error:"), "{out}");
-        assert!(
-            out.contains("keep"),
-            "session should still list keys: {out}"
-        );
-
-        let reloaded = Keychain::load(&file, "oldpass").unwrap();
-        assert_eq!(reloaded.get("keep").map(String::as_str), Some("me"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Interactive mode runs against an existing keychain, so wiping it is a
-    /// CLI-only act. `init` must not be a session command.
-    #[test]
-    fn interactive_init_is_not_a_command() {
-        let dir = temp_dir();
-        let file = dir.join("s.akc");
-        let mut kc = Keychain::new();
-        kc.set("keep", "me".to_string());
-        kc.save(&file, "pw", false).unwrap();
-
-        let out = run_session(&file, "init\nlist\nexit\n", &[], Some("pw"));
-        assert!(out.contains("unknown command: init"), "{out}");
-
-        // The vault must be untouched.
-        let reloaded = Keychain::load(&file, "pw").unwrap();
-        assert_eq!(reloaded.get("keep").map(String::as_str), Some("me"));
-        assert_eq!(backup_count(&dir), 0, "no backup should be created");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn unknown_and_malformed_commands_do_not_abort_the_session() {
-        let dir = temp_dir();
-        let file = dir.join("s.akc");
-        Keychain::new().save(&file, "pw", false).unwrap();
-
-        let out = run_session(
-            &file,
-            "bogus\nget\nget a b\nset onlykey\nlist\nexit\n",
-            &[],
-            Some("pw"),
-        );
-        assert!(out.contains("unknown command: bogus"), "{out}");
-        assert!(out.contains("usage: get <key>"), "{out}");
-        assert!(out.contains("usage: set <key> <value>"), "{out}");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // --- value normalization ---
@@ -712,56 +458,179 @@ mod tests {
         assert!(err.contains("whitespace is removed"), "{err}");
     }
 
+    // --- set / get / list / delete ---
+
     #[test]
-    fn interactive_set_normalizes_and_rejects_blank_values() {
+    fn set_then_get_round_trips() {
         let dir = temp_dir();
         let file = dir.join("s.akc");
-        Keychain::new().save(&file, "pw", false).unwrap();
+        cmd_init(&file, false, "pw").unwrap();
 
-        let out = run_session(
-            &file,
-            "set padded   padded-value  \nset blank    \nexit\n",
-            &[],
-            Some("pw"),
-        );
+        cmd_set(&file, "api_key", Some("sk-123"), "pw").unwrap();
+        cmd_get(&file, "pw", &["api_key".to_string()], false).unwrap();
 
         let kc = Keychain::load(&file, "pw").unwrap();
-        assert_eq!(
-            kc.get("padded").map(String::as_str),
-            Some("padded-value"),
-            "{out}"
-        );
-        assert_eq!(
-            kc.get("blank"),
-            None,
-            "blank value must not be stored: {out}"
-        );
-        // Whichever way the user hits it, the message must state the rule.
-        assert!(
-            out.contains("whitespace is removed") && out.contains("blank value is rejected"),
-            "message should explain the rule: {out}"
-        );
+        assert_eq!(kc.get("api_key").map(String::as_str), Some("sk-123"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // --- CLI: init / change-password ---
+    #[test]
+    fn set_strips_padding_from_values() {
+        let dir = temp_dir();
+        let file = dir.join("s.akc");
+        cmd_init(&file, false, "pw").unwrap();
+
+        cmd_set(&file, "k", Some("  padded  "), "pw").unwrap();
+        let kc = Keychain::load(&file, "pw").unwrap();
+        assert_eq!(kc.get("k").map(String::as_str), Some("padded"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn set_overwrites_an_existing_secret() {
+        let dir = temp_dir();
+        let file = dir.join("s.akc");
+        cmd_init(&file, false, "pw").unwrap();
+
+        cmd_set(&file, "k", Some("first"), "pw").unwrap();
+        cmd_set(&file, "k", Some("second"), "pw").unwrap();
+
+        let kc = Keychain::load(&file, "pw").unwrap();
+        assert_eq!(kc.get("k").map(String::as_str), Some("second"));
+        assert_eq!(kc.keys(), vec!["k"], "must not duplicate the name");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn set_rejects_a_blank_value_without_touching_the_vault() {
+        let dir = temp_dir();
+        let file = dir.join("s.akc");
+        cmd_init(&file, false, "pw").unwrap();
+
+        // A value of "   " is whitespace, not the empty-string signal that
+        // means "read stdin", so it must be rejected rather than prompt.
+        let err = cmd_set(&file, "k", Some("   "), "pw").unwrap_err().to_string();
+        assert!(err.contains("must not be empty"), "{err}");
+
+        let kc = Keychain::load(&file, "pw").unwrap();
+        assert!(kc.keys().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn get_reads_several_names_in_one_open() {
+        let dir = temp_dir();
+        let file = dir.join("s.akc");
+        cmd_init(&file, false, "pw").unwrap();
+        cmd_set(&file, "a", Some("1"), "pw").unwrap();
+        cmd_set(&file, "b", Some("2"), "pw").unwrap();
+
+        let names = vec!["a".to_string(), "b".to_string()];
+        cmd_get(&file, "pw", &names, false).unwrap();
+        cmd_get(&file, "pw", &names, true).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// One missing name must abort the whole read rather than print the names
+    /// that did resolve, so a caller never sees a partial result.
+    #[test]
+    fn get_with_a_missing_name_prints_nothing() {
+        let dir = temp_dir();
+        let file = dir.join("s.akc");
+        cmd_init(&file, false, "pw").unwrap();
+        cmd_set(&file, "present", Some("v"), "pw").unwrap();
+
+        let names = vec!["present".to_string(), "absent".to_string()];
+        let err = cmd_get(&file, "pw", &names, false).unwrap_err().to_string();
+        assert!(err.contains("key not found: absent"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn get_with_no_names_is_an_error() {
+        let dir = temp_dir();
+        let file = dir.join("s.akc");
+        cmd_init(&file, false, "pw").unwrap();
+        assert!(cmd_get(&file, "pw", &[], false).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn list_shows_names_and_filters_when_given_them() {
+        let dir = temp_dir();
+        let file = dir.join("s.akc");
+        cmd_init(&file, false, "pw").unwrap();
+        cmd_set(&file, "alpha", Some("1"), "pw").unwrap();
+        cmd_set(&file, "beta", Some("2"), "pw").unwrap();
+
+        // Listing is a read: naming a missing key is not an error.
+        let names = vec!["alpha".to_string(), "absent".to_string()];
+        cmd_list(&file, "pw", &names, false).unwrap();
+        cmd_list(&file, "pw", &[], true).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn delete_removes_secrets() {
+        let dir = temp_dir();
+        let file = dir.join("s.akc");
+        cmd_init(&file, false, "pw").unwrap();
+        cmd_set(&file, "a", Some("1"), "pw").unwrap();
+        cmd_set(&file, "b", Some("2"), "pw").unwrap();
+
+        cmd_delete(&file, "pw", &["a".to_string()]).unwrap();
+        let kc = Keychain::load(&file, "pw").unwrap();
+        assert_eq!(kc.keys(), vec!["b"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn delete_of_a_missing_name_removes_nothing() {
+        let dir = temp_dir();
+        let file = dir.join("s.akc");
+        cmd_init(&file, false, "pw").unwrap();
+        cmd_set(&file, "keep", Some("me"), "pw").unwrap();
+
+        let names = vec!["keep".to_string(), "absent".to_string()];
+        let err = cmd_delete(&file, "pw", &names).unwrap_err().to_string();
+        assert!(err.contains("key not found: absent"), "{err}");
+
+        // All or nothing: the name that did exist must still be there.
+        let kc = Keychain::load(&file, "pw").unwrap();
+        assert_eq!(kc.get("keep").map(String::as_str), Some("me"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- init ---
+
+    #[test]
+    fn init_creates_a_new_keychain() {
+        let dir = temp_dir();
+        let file = dir.join("new.akc");
+        cmd_init(&file, false, "pw").unwrap();
+        assert!(file.exists());
+        assert_eq!(backup_count(&dir), 0);
+
+        cmd_set(&file, "k", Some("v"), "pw").unwrap();
+        let kc = Keychain::load(&file, "pw").unwrap();
+        assert_eq!(kc.get("k").map(String::as_str), Some("v"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn init_refuses_to_clobber_an_existing_keychain() {
         let dir = temp_dir();
         let file = dir.join("s.akc");
-        let mut kc = Keychain::new();
-        kc.set("keep", "me".to_string());
-        kc.save(&file, "pw", false).unwrap();
+        cmd_init(&file, false, "pw").unwrap();
+        cmd_set(&file, "keep", Some("me"), "pw").unwrap();
 
-        let err = cmd_init(&file, false, Some("pw")).unwrap_err().to_string();
+        let err = cmd_init(&file, false, "pw").unwrap_err().to_string();
         assert!(err.contains("already exists"), "{err}");
-        assert!(err.contains("change-password"), "{err}");
+        assert!(err.contains("--rotate"), "{err}");
 
-        // Untouched, and no backup churn from a refused init.
-        let reloaded = Keychain::load(&file, "pw").unwrap();
-        assert_eq!(reloaded.get("keep").map(String::as_str), Some("me"));
-        assert_eq!(backup_count(&dir), 0);
+        let kc = Keychain::load(&file, "pw").unwrap();
+        assert_eq!(kc.get("keep").map(String::as_str), Some("me"));
+        assert_eq!(backup_count(&dir), 0, "a refused init must not back up");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -769,57 +638,29 @@ mod tests {
     fn init_force_replaces_and_backs_up() {
         let dir = temp_dir();
         let file = dir.join("s.akc");
-        let mut kc = Keychain::new();
-        kc.set("keep", "me".to_string());
-        kc.save(&file, "oldpass", false).unwrap();
+        cmd_init(&file, false, "oldpass").unwrap();
+        cmd_set(&file, "keep", Some("me"), "oldpass").unwrap();
 
-        cmd_init(&file, true, Some("newpass")).unwrap();
+        cmd_init(&file, true, "newpass").unwrap();
 
-        // Fresh, empty, under the new password.
         let reloaded = Keychain::load(&file, "newpass").unwrap();
-        assert_eq!(reloaded.get("keep"), None);
+        assert_eq!(reloaded.get("keep"), None, "force discards the secrets");
         assert!(Keychain::load(&file, "oldpass").is_err());
         assert_eq!(backup_count(&dir), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn init_creates_a_new_keychain() {
-        let dir = temp_dir();
-        let file = dir.join("new.akc");
-        cmd_init(&file, false, Some("pw")).unwrap();
-        assert!(file.exists());
-        assert_eq!(backup_count(&dir), 0);
-        // Usable right away.
-        cmd_set(&file, "k", "v", Some("pw")).unwrap();
-        assert_eq!(
-            Keychain::load(&file, "pw")
-                .unwrap()
-                .get("k")
-                .map(String::as_str),
-            Some("v")
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
+    // --- rotate ---
 
     #[test]
-    fn change_password_keeps_secrets_and_requires_the_old_password() {
+    fn rotate_keeps_every_secret() {
         let dir = temp_dir();
         let file = dir.join("s.akc");
-        let mut kc = Keychain::new();
-        kc.set("keep", "me".to_string());
-        kc.set("other", "value".to_string());
-        kc.save(&file, "oldpass", false).unwrap();
+        cmd_init(&file, false, "oldpass").unwrap();
+        cmd_set(&file, "keep", Some("me"), "oldpass").unwrap();
+        cmd_set(&file, "other", Some("value"), "oldpass").unwrap();
 
-        // A wrong current password cannot even decrypt, so nothing changes.
-        let err = cmd_change_password(&file, Some("wrong"), Some("newpass"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("wrong password"), "{err}");
-        assert!(Keychain::load(&file, "oldpass").is_ok());
-        assert_eq!(backup_count(&dir), 0);
-
-        cmd_change_password(&file, Some("oldpass"), Some("newpass")).unwrap();
+        cmd_rotate(&file, "oldpass", "newpass").unwrap();
 
         let reloaded = Keychain::load(&file, "newpass").unwrap();
         assert_eq!(reloaded.get("keep").map(String::as_str), Some("me"));
@@ -829,63 +670,155 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A wrong current key cannot decrypt, so it must fail before anything is
+    /// written or backed up.
     #[test]
-    fn change_password_requires_an_existing_keychain() {
+    fn rotate_with_a_wrong_key_changes_nothing() {
         let dir = temp_dir();
-        let file = dir.join("missing.akc");
-        let err = cmd_change_password(&file, Some("pw"), Some("pw"))
+        let file = dir.join("s.akc");
+        cmd_init(&file, false, "oldpass").unwrap();
+        cmd_set(&file, "keep", Some("me"), "oldpass").unwrap();
+
+        let err = cmd_rotate(&file, "wrong", "newpass").unwrap_err().to_string();
+        assert!(err.contains("wrong password"), "{err}");
+
+        assert!(Keychain::load(&file, "oldpass").is_ok());
+        assert_eq!(backup_count(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rotate_requires_an_existing_keychain() {
+        let dir = temp_dir();
+        let err = cmd_rotate(&dir.join("missing.akc"), "pw", "pw")
             .unwrap_err()
             .to_string();
         assert!(err.contains("not found"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn set_rejects_a_blank_value_without_touching_the_vault() {
-        let dir = temp_dir();
-        let file = dir.join("s.akc");
-        Keychain::new().save(&file, "pw", false).unwrap();
+    // --- key resolution ---
 
-        for blank in ["", "   ", "\t"] {
-            let err = cmd_set(&file, "k", blank, Some("pw"))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("must not be empty"), "{err}");
-            assert!(
-                err.contains("whitespace is removed"),
-                "error should explain the rule: {err}"
-            );
-        }
-        let kc = Keychain::load(&file, "pw").unwrap();
-        assert_eq!(kc.keys(), Vec::<&str>::new());
-        std::fs::remove_dir_all(&dir).unwrap();
+    #[test]
+    fn a_literal_password_wins() {
+        let key = resolve_key(Some("literal"), None, &Config::default()).unwrap();
+        assert_eq!(key.as_str(), "literal");
     }
 
     #[test]
-    fn set_strips_padding_from_values() {
-        let dir = temp_dir();
-        let file = dir.join("s.akc");
-        Keychain::new().save(&file, "pw", false).unwrap();
-
-        cmd_set(&file, "k", "  padded  ", Some("pw")).unwrap();
-        let kc = Keychain::load(&file, "pw").unwrap();
-        assert_eq!(kc.get("k").map(String::as_str), Some("padded"));
-        std::fs::remove_dir_all(&dir).unwrap();
+    fn an_empty_literal_password_is_rejected() {
+        assert!(resolve_key(Some(""), None, &Config::default()).is_err());
     }
 
+    /// A named key file must exist: silently falling back to a prompt would
+    /// leave an agent hanging on a file the user believed was configured.
     #[test]
-    fn wrong_password_aborts_the_session() {
-        let dir = temp_dir();
-        let file = dir.join("s.akc");
-        Keychain::new().save(&file, "right", false).unwrap();
-
-        let mut out: Vec<u8> = Vec::new();
-        let mut input = std::io::Cursor::new(b"list\nexit\n".to_vec());
-        let mut prompt = |_: &str| Ok("wrong".to_string());
-        let err = interactive_session(&file, &mut input, &mut out, &mut prompt, None)
+    fn a_missing_named_key_file_is_an_error() {
+        let err = resolve_key(None, Some(Path::new("/nonexistent/key")), &Config::default())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("wrong password"), "{err}");
+        assert!(err.contains("key file not found"), "{err}");
+    }
+
+    #[test]
+    fn a_key_file_is_read_from_the_config() {
+        let dir = temp_dir();
+        let key_path = dir.join("key");
+        std::fs::write(&key_path, "from-file\n").unwrap();
+
+        let config = Config {
+            keychain: None,
+            key_file: Some(key_path),
+        };
+        let key = resolve_key(None, None, &config).unwrap();
+        assert_eq!(key.as_str(), "from-file");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_key_file_must_exist() {
+        let err = resolve_new_key(None, Some(Path::new("/nonexistent/key")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("new key file not found"), "{err}");
+    }
+
+    // --- concurrent writers ---
+
+    /// Regression: the vault is one blob that every write rewrites wholesale, so
+    /// two writers that both read before either saved would clobber each other
+    /// and silently lose a secret. Before the write lock, ten concurrent `set`
+    /// calls left one key standing.
+    #[test]
+    fn concurrent_writers_do_not_lose_secrets() {
+        let dir = temp_dir();
+        let file = dir.join("s.akc");
+        cmd_init(&file, false, "pw").unwrap();
+
+        const WRITERS: usize = 6;
+        std::thread::scope(|scope| {
+            for i in 0..WRITERS {
+                let file = &file;
+                scope.spawn(move || {
+                    mutate(file, "pw", |kc| {
+                        kc.set(&format!("key{i}"), format!("value{i}"));
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        let kc = Keychain::load(&file, "pw").unwrap();
+        assert_eq!(kc.keys().len(), WRITERS, "lost writes: {:?}", kc.keys());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `mutate` reloads inside the lock, so a write made after the caller last
+    /// read the vault is preserved rather than overwritten by the stale copy.
+    #[test]
+    fn mutate_reloads_before_writing() {
+        let dir = temp_dir();
+        let file = dir.join("s.akc");
+        cmd_init(&file, false, "pw").unwrap();
+
+        // What a long-lived caller holds: state read before the other write.
+        let stale = Keychain::load(&file, "pw").unwrap();
+        assert!(stale.keys().is_empty());
+
+        cmd_set(&file, "theirs", Some("other"), "pw").unwrap();
+
+        mutate(&file, "pw", |kc| {
+            kc.set("mine", "value".to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        let reloaded = Keychain::load(&file, "pw").unwrap();
+        assert_eq!(reloaded.get("mine").map(String::as_str), Some("value"));
+        assert_eq!(reloaded.get("theirs").map(String::as_str), Some("other"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A rejected mutation must not rewrite the vault.
+    #[test]
+    fn a_rejected_mutation_leaves_the_vault_alone() {
+        let dir = temp_dir();
+        let file = dir.join("s.akc");
+        cmd_init(&file, false, "pw").unwrap();
+        cmd_set(&file, "keep", Some("me"), "pw").unwrap();
+        let before = std::fs::read(&file).unwrap();
+
+        let err = mutate(&file, "pw", |kc| {
+            kc.set("added", "x".to_string());
+            anyhow::bail!("rejected")
+        })
+        .err()
+        .expect("the mutation should have failed")
+        .to_string();
+        assert!(err.contains("rejected"), "{err}");
+
+        assert_eq!(std::fs::read(&file).unwrap(), before, "file was rewritten");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

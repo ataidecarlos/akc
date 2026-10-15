@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 use anyhow::{Context, ensure};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -137,6 +137,49 @@ impl Keychain {
     pub fn len(&self) -> usize {
         self.store.secrets.len()
     }
+}
+
+/// Serializes writers on one vault.
+///
+/// Held across the whole load -> modify -> save cycle. Without it two writers
+/// both read the same state and whichever saves second silently discards the
+/// other's change: the vault is a single blob, so there is nothing for the
+/// filesystem or for git to merge.
+///
+/// Readers take no lock. `save` publishes by atomic rename, so a reader sees
+/// either the old file or the new one, never a partial write.
+pub struct Lock {
+    _file: std::fs::File,
+}
+
+impl Lock {
+    /// Block until this process holds the vault's write lock.
+    ///
+    /// The lock file is a sibling of the vault and is deliberately never
+    /// removed. Unlinking it would let a later process create and lock a fresh
+    /// inode while an earlier one still holds the old, and both would proceed.
+    pub fn acquire(vault: &Path) -> anyhow::Result<Self> {
+        let path = lock_path(vault)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("cannot open lock file {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("cannot lock {}", vault.display()))?;
+        Ok(Lock { _file: file })
+    }
+}
+
+/// `<vault>.lock`, beside the vault.
+fn lock_path(vault: &Path) -> anyhow::Result<PathBuf> {
+    let mut name = vault
+        .file_name()
+        .context("keychain path must include a file name")?
+        .to_os_string();
+    name.push(".lock");
+    Ok(vault.with_file_name(name))
 }
 
 impl Drop for Store {

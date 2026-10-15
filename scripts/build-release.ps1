@@ -4,7 +4,7 @@
 #   .\scripts\build-release.ps1 [-OutputDir target\release-dist]
 #
 # Produces akc-windows-x86_64.exe and akc-windows-aarch64.exe, matching the asset
-# names that `akc upgrade` looks for.
+# names that `akc --update` looks for.
 #
 # Requires the MSVC build tools and both Rust targets:
 #   rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc

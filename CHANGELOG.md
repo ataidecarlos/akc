@@ -5,6 +5,92 @@ All notable changes to akc are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0] - 2026-10-15
+
+The command line is redesigned. This is a breaking release; the migration table is
+at the end of this section.
+
+### Added
+
+- **A config file at `~/.config/akc/config`.** It names the keychain and the
+  master key file, so `akc NAME` works from any process with no path and no
+  prompt. Override per-invocation with `--keychain` and `--key-file`. The format
+  is `key = value`; an unknown setting is an error rather than being silently
+  ignored.
+- **Master key files.** `--key-file`, `AKC_KEY_FILE`, or the config's `key_file`,
+  falling back to `~/.config/akc/key`. Only the trailing newline is stripped, so
+  a key written by `printf` behaves identically to one written by `echo`, and a
+  key with meaningful surrounding spaces keeps them. This is what lets an agent
+  fetch a secret with nothing configured in its environment.
+- **`--json`** for reads, so a caller does not have to parse output by eye.
+- **`--set` reads the value from stdin** when no value is given, so a secret need
+  never appear in `argv` where any local process could read it from `ps`. A
+  terminal gets a hidden prompt instead of a visible one, which would leave the
+  value in the scrollback. `--set ""` is an explicitly empty value and is
+  rejected — a different thing from `--set`, and from `--set "   "`.
+- **`--rotate`**, replacing `change-password`, with `--new-key-file` and
+  `--new-password` for non-interactive use. The vault is a single blob, so this
+  is one re-encrypt rather than a loop over secrets, and it costs the same
+  whether the vault holds one key or a thousand. It backs the old file up and
+  refuses to write if the current key is wrong.
+- **macOS (Apple Silicon) is now a published platform.** `akc-macos-aarch64` joins
+  the four existing assets, so `--update` works on an M-series Mac. Previously the
+  only way to run akc there was to build it.
+- **`scripts/build-release-macos.sh`**, which cross-builds all five assets from a
+  Mac using `cargo-xwin` for the MSVC Windows targets and `cargo-zigbuild` for the
+  musl Linux ones — so a release no longer needs a Windows box and a WSL box.
+- **A write lock on every write**, on `<vault>.lock`, held across the whole
+  read-modify-write cycle and reloading inside it. Add `*.lock` to your
+  `.gitignore`.
+- `scripts/akc-git.sh`, wrapping an akc command with the pull-before-write,
+  push-after sequence a vault committed to git needs, rebasing and retrying when
+  the push is rejected.
+
+### Changed
+
+- **Breaking: the command syntax is now flags on a bare NAME.** `akc NAME` reads
+  a secret, `akc NAME --set VALUE` writes one, `akc --list` lists, `akc NAME
+  --delete` removes. Every command is a flag and the bare positional is only ever
+  a secret name, so a secret can never collide with a command word.
+- **Breaking: the keychain path is no longer a positional argument.** It comes
+  from the config file or `--keychain`.
+- **Breaking: reading takes one or more names** and prints one value per line, so
+  reading several secrets costs a single key derivation rather than one each. A
+  name that does not exist aborts the whole read rather than printing a partial
+  result for a caller to misread.
+- **Breaking: `upgrade` is now `--update`**, and its `--version` is now `--to`.
+
+### Removed
+
+- **Breaking: interactive mode.** The flag-based syntax does not translate to a
+  line-oriented REPL, and the tool is built for agents. `--init --force` remains
+  the way to discard a vault.
+
+### Fixed
+
+- **Concurrent writes no longer lose secrets.** The vault is a single blob
+  rewritten wholesale by every write, so a second writer holding state it read
+  before the first writer saved would silently discard the first writer's change.
+  Ten concurrent writes left one key standing.
+
+### Migrating from 3.x
+
+| 3.x | 4.0.0 |
+|---|---|
+| `akc secrets.akc get NAME` | `akc --keychain secrets.akc NAME` |
+| `akc secrets.akc set NAME VALUE` | `akc --keychain secrets.akc NAME --set VALUE` |
+| `akc secrets.akc list` | `akc --keychain secrets.akc --list` |
+| `akc secrets.akc delete NAME` | `akc --keychain secrets.akc NAME --delete` |
+| `akc secrets.akc init` | `akc --keychain secrets.akc --init` |
+| `akc secrets.akc change-password` | `akc --keychain secrets.akc --rotate` |
+| `akc upgrade --version X` | `akc --update --to X` |
+| `akc secrets.akc` (interactive) | removed |
+
+Put the keychain and key paths in `~/.config/akc/config` and every `--keychain`
+above disappears. Vaults written by 3.x need no migration: the container format
+is unchanged, only the command line moved. macOS users had no binary before this
+release, so for them it is a first install rather than an upgrade.
+
 ## [3.0.0] - 2026-10-03
 
 ### Added

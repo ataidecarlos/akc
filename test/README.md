@@ -42,7 +42,9 @@ cargo test
 ./test/test.sh
 ```
 
-Both unit and integration tests must pass before any release.
+Both unit and integration tests must pass before any release. CI runs
+`cargo test` plus the platform's integration suite on Linux, macOS and Windows
+(`.github/workflows/ci.yml`).
 
 ## Regression tests worth knowing about
 
@@ -74,6 +76,13 @@ failure mode is silent:
   readable and is rewritten in the current container.
 - `crypto::tests::out_of_range_params_are_rejected_before_allocating` — a hostile
   header cannot request an unbounded Argon2 allocation.
+
+- `crypto::tests::short_magic_prefixed_file_is_rejected_without_panicking` — a
+  truncated container used to index past the end of the slice and panic.
+- `main::tests::exit_codes_are_distinct` — a caller must be able to tell a wrong
+  key from a missing name.
+- `upgrade::tests::oversized_downloads_are_rejected_before_reading` — a bad URL
+  or hostile response must not be buffered into memory.
 
 ## What's Tested
 

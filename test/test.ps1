@@ -60,7 +60,9 @@ function Assert-True {
 function Invoke-Akc {
     param([string[]]$AkcArgs)
     $ErrorActionPreference = "Continue"
-    $output = & $exe @AkcArgs 2>&1 | Out-String
+    # Piping an empty string keeps an interactive `--delete` confirmation from
+    # waiting on the console when the suite is run from a terminal.
+    $output = "" | & $exe @AkcArgs 2>&1 | Out-String
     [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output.Trim() }
 }
 
@@ -68,7 +70,7 @@ function Invoke-Akc {
 function Invoke-AkcPw {
     param([string[]]$AkcArgs, [string]$Password)
     $ErrorActionPreference = "Continue"
-    $output = & $exe @AkcArgs --password $Password 2>&1 | Out-String
+    $output = "" | & $exe @AkcArgs --password $Password 2>&1 | Out-String
     [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output.Trim() }
 }
 
@@ -79,7 +81,7 @@ function Invoke-AkcEnv {
     $previous = $env:AKC_PASSWORD
     $env:AKC_PASSWORD = $Password
     try {
-        $output = & $exe @AkcArgs 2>&1 | Out-String
+        $output = "" | & $exe @AkcArgs 2>&1 | Out-String
         $code = $LASTEXITCODE
     }
     finally {
@@ -209,6 +211,21 @@ try {
     Assert-True "wrong password list fails" ($r.ExitCode -ne 0) $r.Output
     $r = Invoke-AkcPw @("evil", "--set", "x") -Password "wrong-pass"
     Assert-True "wrong password set fails" ($r.ExitCode -ne 0) $r.Output
+
+    # --- exit codes and truncated containers ---
+    $short = Join-Path $work "short.akc"
+    [System.IO.File]::WriteAllBytes($short, [System.Text.Encoding]::ASCII.GetBytes("AKCSTORE"))
+    $r = Invoke-Akc @("--keychain", $short, "--key-file", $key, "anything")
+    Assert-True "truncated container fails instead of panicking" ($r.ExitCode -eq 1 -and $r.Output -match "truncated") $r.Output
+
+    $r = Invoke-Akc @("missing_key")
+    Assert-True "missing secret exits 4" ($r.ExitCode -eq 4) $r.Output
+
+    $r = Invoke-AkcPw @("alpha") -Password "wrong-pass"
+    Assert-True "wrong password exits 3" ($r.ExitCode -eq 3) $r.Output
+
+    $r = Invoke-Akc @("alpha", "--json", "--set", "x")
+    Assert-True "--json is rejected for writes" ($r.ExitCode -eq 2 -and $r.Output -match "--json only applies") $r.Output
 
     # --- the config file is what makes the path-free form work ---
     $r = Invoke-Akc @("alpha")

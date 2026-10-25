@@ -85,11 +85,15 @@ for attempt in 1 2 3; do
         git rebase --abort >/dev/null 2>&1 || true
         cat >&2 <<EOF
 
-error: the remote also changed $vault, so one side's write has to be re-applied.
-git cannot merge an encrypted blob. Your change is still in your last commit:
+error: the remote also changed $vault, and git cannot merge an encrypted blob.
+Your write is still in the last commit. Keep it reachable before taking the
+remote's version:
 
+  git branch akc-write-backup      # point a name at your commit
   git reset --hard '@{upstream}'   # take the remote's version
   ...then re-run the command you just ran, and commit.
+
+The backup branch holds your commit until you delete it.
 EOF
         exit 1
     fi

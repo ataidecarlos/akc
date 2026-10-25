@@ -16,3 +16,6 @@ ruvector.db
 # Vera code-search index (local semantic search). Never commit the index.
 .vera/
 .vera.lock
+
+# Local graph output from codebase tooling.
+/graphify-out/

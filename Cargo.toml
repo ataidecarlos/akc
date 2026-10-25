@@ -2,6 +2,10 @@
 name = "akc"
 version = "4.0.0"
 edition = "2024"
+rust-version = "1.89"
+description = "Minimal encrypted keychain in one portable file"
+repository = "https://github.com/ataidecarlos/akc"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 aes-gcm = { version = "0.10.3", features = ["zeroize"] }

@@ -16,6 +16,7 @@ CANDIDATES=(
     "target/release/akc"
     "target/release/akc.exe"
     "target/debug/akc"
+    "target/debug/akc.exe"
 )
 
 # The first candidate that exists AND runs here. Cross-built artifacts land
@@ -103,7 +104,9 @@ trap cleanup EXIT
 run_akc() {
     local tmpfile; tmpfile=$(mktemp)
     EXIT_CODE=0
-    "$AKC" "$@" > "$tmpfile" 2>&1 || EXIT_CODE=$?
+    # /dev/null keeps an interactive `--delete` confirmation from waiting on a
+    # terminal when the suite itself is run from one.
+    "$AKC" "$@" < /dev/null > "$tmpfile" 2>&1 || EXIT_CODE=$?
     AKC_OUTPUT=$(cat "$tmpfile")
     rm -f "$tmpfile"
 }
@@ -113,7 +116,7 @@ run_akc_pw() {
     local pw="$1"; shift
     local tmpfile; tmpfile=$(mktemp)
     EXIT_CODE=0
-    "$AKC" --password "$pw" "$@" > "$tmpfile" 2>&1 || EXIT_CODE=$?
+    "$AKC" --password "$pw" "$@" < /dev/null > "$tmpfile" 2>&1 || EXIT_CODE=$?
     AKC_OUTPUT=$(cat "$tmpfile")
     rm -f "$tmpfile"
 }
@@ -226,6 +229,22 @@ assert_true "wrong password list fails" "$([[ $EXIT_CODE -ne 0 ]] && echo 0 || e
 
 run_akc_pw "wrong-pass" evil --set x
 assert_true "wrong password set fails" "$([[ $EXIT_CODE -ne 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
+
+# --- exit codes and truncated containers ---
+printf 'AKCSTORE' > "$WORK/short.akc"
+run_akc --keychain "$WORK/short.akc" --key-file "$KEY" anything
+assert_true "a truncated container fails instead of panicking" \
+    "$([[ $EXIT_CODE -eq 1 && "$AKC_OUTPUT" == *"truncated"* ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
+
+run_akc missing_key
+assert_true "missing secret exits 4" "$([[ $EXIT_CODE -eq 4 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
+
+run_akc_pw "wrong-pass" alpha
+assert_true "wrong password exits 3" "$([[ $EXIT_CODE -eq 3 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
+
+run_akc alpha --json --set x
+assert_true "--json is rejected for writes" \
+    "$([[ $EXIT_CODE -eq 2 && "$AKC_OUTPUT" == *"--json only applies"* ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
 # --- the config file is what makes the path-free form work ---
 run_akc alpha

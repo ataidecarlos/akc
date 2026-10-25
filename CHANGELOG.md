@@ -5,6 +5,38 @@ All notable changes to akc are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A file shorter than a header that starts with `AKCSTORE` (a truncated download
+  or a half-synced file) panicked instead of reporting a truncation error.
+- KDF parameters from a file header were bounded at 1 GiB; the cap is now
+  256 MiB, so a crafted file cannot force a multi-gigabyte allocation.
+- `--update` now has a 60-second HTTP timeout and a 64 MiB download cap, so a
+  stalled or hostile server cannot hang the process or exhaust memory.
+- `--init` no longer uses `--password` / `AKC_PASSWORD` as the new master key.
+- `akc-git.sh`'s conflict message no longer recommends a `git reset --hard`
+  that would discard the commit holding the user's write.
+
+### Changed
+
+- Distinct exit codes: 2 bad arguments, 3 wrong key or corrupt vault, 4 not
+  found. With `--json`, errors are printed as `{"error": "..."}`.
+- `--delete` asks for confirmation on a terminal; `--yes` skips it.
+  Non-interactive callers are never prompted.
+- Flags belonging to another command (`--to`, `--yes`, `--new-password`,
+  `--json`) are rejected instead of silently ignored.
+- A bare `akc` prints help.
+- On Unix, a key file readable by other users produces a warning.
+- `--set` help no longer leaks an implementation note, and `akc --set VALUE`
+  now explains that the name goes first.
+- Added CI for Linux, macOS and Windows, MIT/Apache-2.0 license files, and
+  Cargo metadata.
+- README: quick start at the top, checksum verification in the install steps,
+  platform-correct config paths, exit codes, and honest limits (zeroization,
+  multi-machine locking, rollback, updater trust).
+
 ## [4.0.0] - 2026-10-15
 
 The command line is redesigned. This is a breaking release; the migration table is

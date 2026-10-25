@@ -1,8 +1,8 @@
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
-use clap::{ArgGroup, Parser};
+use anyhow::{Context, Result, ensure};
+use clap::{ArgGroup, CommandFactory, Parser};
 use zeroize::Zeroizing;
 
 mod config;
@@ -50,9 +50,9 @@ struct Cli {
 
     /// Store NAME, overwriting it if present; reads the value from stdin when
     /// no VALUE is given
-    ///
-    /// `Option<Option<_>>` is what distinguishes `--set` (read stdin) from
-    /// `--set ""` (an empty value, which is rejected).
+    // `Option<Option<_>>` is what distinguishes `--set` (read stdin) from
+    // `--set ""` (an empty value, which is rejected). Keep that out of the
+    // help text: it is an implementation note, not a user-facing one.
     #[arg(long, value_name = "VALUE", num_args = 0..=1)]
     set: Option<Option<String>>,
 
@@ -93,7 +93,7 @@ struct Cli {
     #[arg(long)]
     force: bool,
 
-    /// With --update: skip the confirmation prompt
+    /// With --update or --delete: skip the confirmation prompt
     #[arg(long, short = 'y')]
     yes: bool,
 
@@ -102,24 +102,112 @@ struct Cli {
     to: Option<String>,
 }
 
-fn main() {
-    if let Err(err) = run() {
-        eprintln!("error: {err:#}");
-        std::process::exit(1);
+/// Errors that carry their own process exit code, so a caller can branch
+/// without parsing the message.
+#[derive(Debug)]
+struct NotFound(String);
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
-fn run() -> Result<()> {
+impl std::error::Error for NotFound {}
+
+#[derive(Debug)]
+struct Usage(String);
+
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Usage {}
+
+fn not_found(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(NotFound(message.into()))
+}
+
+fn usage(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Usage(message.into()))
+}
+
+fn main() {
     let cli = Cli::parse();
+
+    // A bare `akc` should show help, not scold.
+    if cli.names.is_empty()
+        && !cli.init
+        && cli.set.is_none()
+        && !cli.delete
+        && !cli.list
+        && !cli.rotate
+        && !cli.update
+    {
+        let _ = Cli::command().print_help();
+        println!();
+        std::process::exit(2);
+    }
+
+    let json = cli.json;
+    if let Err(err) = run(cli) {
+        if json {
+            eprintln!("{}", serde_json::json!({ "error": format!("{err:#}") }));
+        } else {
+            eprintln!("error: {err:#}");
+        }
+        std::process::exit(exit_code(&err));
+    }
+}
+
+/// 0 ok, 1 general, 2 bad arguments, 3 wrong key or corrupt vault, 4 not found.
+fn exit_code(err: &anyhow::Error) -> i32 {
+    if err.downcast_ref::<crypto::AuthError>().is_some() {
+        3
+    } else if err.downcast_ref::<NotFound>().is_some() {
+        4
+    } else if err.downcast_ref::<Usage>().is_some() {
+        2
+    } else {
+        1
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
     let config = Config::load()?;
 
+    // A flag that belongs to another command is an error, not a silent no-op.
+    if cli.to.is_some() && !cli.update {
+        return Err(usage("--to only applies to --update"));
+    }
+    if cli.yes && !(cli.update || cli.delete) {
+        return Err(usage("--yes only applies to --update or --delete"));
+    }
+    if (cli.new_password.is_some() || cli.new_key_file.is_some()) && !(cli.init || cli.rotate) {
+        return Err(usage(
+            "--new-password and --new-key-file only apply to --init or --rotate",
+        ));
+    }
+    if cli.force && !(cli.init || cli.update) {
+        return Err(usage("--force only applies to --init or --update"));
+    }
+    if cli.json && (cli.init || cli.rotate || cli.update || cli.set.is_some() || cli.delete) {
+        return Err(usage(
+            "--json only applies to reading: `akc NAME...` or `akc --list`",
+        ));
+    }
+
     if cli.update {
-        ensure!(cli.names.is_empty(), "--update does not take secret names");
+        if !cli.names.is_empty() {
+            return Err(usage("--update does not take secret names"));
+        }
         return upgrade::run(cli.force, cli.yes, cli.to.as_deref());
     }
 
     let file = cli.keychain.clone().or(config.keychain.clone()).context(
-        "no keychain configured: set `keychain` in ~/.config/akc/config, or pass --keychain",
+        "no keychain configured: set `keychain` in the akc config file, or pass --keychain",
     )?;
 
     let key_file = cli
@@ -130,9 +218,14 @@ fn run() -> Result<()> {
     // `--init` only ever sets a key, so it must not be made to open the vault
     // first -- that would prompt for a key that does not exist yet.
     if cli.init {
-        ensure!(cli.names.is_empty(), "--init does not take secret names");
+        if !cli.names.is_empty() {
+            return Err(usage("--init does not take secret names"));
+        }
+        // Deliberately no fallback to --password / AKC_PASSWORD: those unlock
+        // an existing vault, and a key exported for reading must not silently
+        // become the master key of a newly initialised one.
         let replacement = resolve_new_key(
-            cli.new_password.as_deref().or(cli.password.as_deref()),
+            cli.new_password.as_deref(),
             cli.new_key_file
                 .as_deref()
                 .or(key_file.as_deref())
@@ -144,7 +237,9 @@ fn run() -> Result<()> {
     let password = resolve_key(cli.password.as_deref(), key_file.as_deref(), &config)?;
 
     if cli.rotate {
-        ensure!(cli.names.is_empty(), "--rotate does not take secret names");
+        if !cli.names.is_empty() {
+            return Err(usage("--rotate does not take secret names"));
+        }
         let replacement =
             resolve_new_key(cli.new_password.as_deref(), cli.new_key_file.as_deref())?;
         return cmd_rotate(&file, &password, &replacement);
@@ -154,12 +249,14 @@ fn run() -> Result<()> {
     }
     if let Some(value) = cli.set.as_ref() {
         let [name] = cli.names.as_slice() else {
-            bail!("--set takes exactly one NAME");
+            return Err(usage(
+                "--set takes exactly one NAME: put the name before the flag, e.g. akc NAME --set VALUE",
+            ));
         };
         return cmd_set(&file, name, value.as_deref(), &password);
     }
     if cli.delete {
-        return cmd_delete(&file, &password, &cli.names);
+        return cmd_delete(&file, &password, &cli.names, cli.yes);
     }
     cmd_get(&file, &password, &cli.names, cli.json)
 }
@@ -185,7 +282,7 @@ fn resolve_key(
     if let Some(path) = key_file.or(config.key_file.as_deref()) {
         ensure!(
             path.exists(),
-            "key file not found: {} (set `key_file` in ~/.config/akc/config, or pass --key-file)",
+            "key file not found: {} (set `key_file` in the akc config file, or pass --key-file)",
             path.display()
         );
         return read_key_file(path);
@@ -297,7 +394,9 @@ fn cmd_init(file: &Path, force: bool, password: &str) -> Result<()> {
 /// Note what this cannot do: if the vault is committed to git, the old key
 /// still opens every commit made before the rotation.
 fn cmd_rotate(file: &Path, current: &str, replacement: &str) -> Result<()> {
-    ensure!(file.exists(), "keychain not found: {}", file.display());
+    if !file.exists() {
+        return Err(not_found(format!("keychain not found: {}", file.display())));
+    }
     let _lock = Lock::acquire(file)?;
     let kc = Keychain::load(file, current)?;
     rekey(file, &kc, replacement, &mut std::io::stdout())
@@ -317,20 +416,22 @@ fn rekey(file: &Path, kc: &Keychain, new_password: &str, out: &mut impl Write) -
 /// Store a secret. `value` is `None` when the flag was given with nothing after
 /// it, which is the signal to read the secret from stdin instead of argv.
 fn cmd_set(file: &Path, name: &str, value: Option<&str>, password: &str) -> Result<()> {
-    let raw = match value {
+    let raw = Zeroizing::new(match value {
         Some(value) => value.to_string(),
         None => read_value()?,
-    };
-    let value = normalize_value(&raw)?;
+    });
+    let value = Zeroizing::new(normalize_value(&raw)?);
     mutate(file, password, |kc| {
-        kc.set(name, value);
+        kc.set(name, value.to_string());
         Ok(())
     })?;
     Ok(())
 }
 
 fn cmd_get(file: &Path, password: &str, names: &[String], json: bool) -> Result<()> {
-    ensure!(!names.is_empty(), "no secret name given");
+    if names.is_empty() {
+        return Err(usage("no secret name given"));
+    }
     let kc = Keychain::load(file, password)?;
 
     // Every name is resolved before anything is printed, so a missing one
@@ -339,7 +440,7 @@ fn cmd_get(file: &Path, password: &str, names: &[String], json: bool) -> Result<
     for name in names {
         let value = kc
             .get(name)
-            .with_context(|| format!("key not found: {name}"))?;
+            .ok_or_else(|| not_found(format!("key not found: {name}")))?;
         values.push((name.as_str(), value.as_str()));
     }
 
@@ -383,11 +484,34 @@ fn cmd_list(file: &Path, password: &str, names: &[String], json: bool) -> Result
 
 /// Remove one or more secrets. All or nothing: if any name is missing, nothing
 /// is written.
-fn cmd_delete(file: &Path, password: &str, names: &[String]) -> Result<()> {
-    ensure!(!names.is_empty(), "no secret name given");
+///
+/// On a terminal this asks first: unlike `--init` there is no `--force` guard
+/// and unlike `--rotate` there is no backup, so a typo would be final. A
+/// non-interactive caller (an agent, a script) is not made to hang on a prompt;
+/// `--yes` skips it explicitly.
+fn cmd_delete(file: &Path, password: &str, names: &[String], yes: bool) -> Result<()> {
+    if names.is_empty() {
+        return Err(usage("no secret name given"));
+    }
+    if !yes && std::io::stdin().is_terminal() {
+        print!(
+            "Delete {} from {}? [y/N] ",
+            names.join(", "),
+            file.display()
+        );
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
     mutate(file, password, |kc| {
         for name in names {
-            ensure!(kc.delete(name), "key not found: {name}");
+            if !kc.delete(name) {
+                return Err(not_found(format!("key not found: {name}")));
+            }
         }
         Ok(())
     })?;
@@ -578,7 +702,7 @@ mod tests {
         cmd_set(&file, "a", Some("1"), "pw").unwrap();
         cmd_set(&file, "b", Some("2"), "pw").unwrap();
 
-        cmd_delete(&file, "pw", &["a".to_string()]).unwrap();
+        cmd_delete(&file, "pw", &["a".to_string()], true).unwrap();
         let kc = Keychain::load(&file, "pw").unwrap();
         assert_eq!(kc.keys(), vec!["b"]);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -592,7 +716,9 @@ mod tests {
         cmd_set(&file, "keep", Some("me"), "pw").unwrap();
 
         let names = vec!["keep".to_string(), "absent".to_string()];
-        let err = cmd_delete(&file, "pw", &names).unwrap_err().to_string();
+        let err = cmd_delete(&file, "pw", &names, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("key not found: absent"), "{err}");
 
         // All or nothing: the name that did exist must still be there.
@@ -820,5 +946,15 @@ mod tests {
 
         assert_eq!(std::fs::read(&file).unwrap(), before, "file was rewritten");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- exit codes ---
+
+    #[test]
+    fn exit_codes_are_distinct() {
+        assert_eq!(exit_code(&anyhow::Error::new(crypto::AuthError)), 3);
+        assert_eq!(exit_code(&not_found("key not found: x")), 4);
+        assert_eq!(exit_code(&usage("bad flag")), 2);
+        assert_eq!(exit_code(&anyhow::anyhow!("other")), 1);
     }
 }

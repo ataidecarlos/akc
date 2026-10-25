@@ -1,12 +1,20 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::Client;
 use semver::Version;
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const GITHUB_OWNER: &str = "ataidecarlos";
 const GITHUB_REPO: &str = "akc";
+
+/// A stalled connection must not hang `akc --update` forever.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Release assets are a few MiB. Cap the read so a wrong URL or a hostile
+/// response cannot exhaust memory.
+const MAX_DOWNLOAD: u64 = 64 * 1024 * 1024;
 
 struct ReleaseInfo {
     version: Version,
@@ -79,6 +87,7 @@ pub fn run(force: bool, yes: bool, version: Option<&str>) -> Result<()> {
 fn make_client() -> Result<Client> {
     Client::builder()
         .user_agent(format!("akc/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(HTTP_TIMEOUT)
         .build()
         .context("failed to build HTTP client")
 }
@@ -177,7 +186,28 @@ fn asset_name_for(os: &str, arch: &str) -> Result<String> {
 fn download_file(url: &str) -> Result<Vec<u8>> {
     let client = make_client()?;
     let response = client.get(url).send()?.error_for_status()?;
-    Ok(response.bytes()?.to_vec())
+    check_download_size(response.content_length())?;
+    let mut body = Vec::new();
+    response.take(MAX_DOWNLOAD + 1).read_to_end(&mut body)?;
+    ensure!(
+        body.len() as u64 <= MAX_DOWNLOAD,
+        "download exceeds {} MiB limit",
+        MAX_DOWNLOAD / 1024 / 1024
+    );
+    Ok(body)
+}
+
+/// Reject an oversized download from its Content-Length before reading it.
+/// A response without one is still bounded by the `take` in `download_file`.
+fn check_download_size(len: Option<u64>) -> Result<()> {
+    if let Some(len) = len {
+        ensure!(
+            len <= MAX_DOWNLOAD,
+            "download exceeds {} MiB limit",
+            MAX_DOWNLOAD / 1024 / 1024
+        );
+    }
+    Ok(())
 }
 
 fn verify_checksum(binary_data: &[u8], checksum_data: &[u8], binary_name: &str) -> Result<()> {
@@ -362,6 +392,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not found in checksums.txt"), "{err}");
+    }
+
+    #[test]
+    fn oversized_downloads_are_rejected_before_reading() {
+        assert!(check_download_size(Some(MAX_DOWNLOAD)).is_ok());
+        assert!(check_download_size(Some(MAX_DOWNLOAD + 1)).is_err());
+        // No Content-Length: the read itself is capped.
+        assert!(check_download_size(None).is_ok());
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! Where the keychain and the master key live.
 //!
-//! Resolved from `~/.config/akc/config`, so `akc NAME` works from any process
-//! with no arguments and no prompt -- which is the point of the tool. The file
-//! is deliberately `key = value` rather than real TOML: two settings do not
-//! justify pulling in a parser.
+//! Resolved from the akc config file -- `%APPDATA%\akc\config` on Windows,
+//! `$XDG_CONFIG_HOME/akc/config` when set, otherwise `~/.config/akc/config` --
+//! so `akc NAME` works from any process with no arguments and no prompt, which
+//! is the point of the tool. The file is deliberately `key = value` rather than
+//! real TOML: two settings do not justify pulling in a parser.
 
 use std::path::{Path, PathBuf};
 
@@ -107,12 +108,32 @@ fn expand(value: &str) -> PathBuf {
     }
 }
 
+/// The key file is the whole security boundary, so a mode that lets other
+/// users read it deserves a warning even though akc cannot fix it.
+#[cfg(unix)]
+fn warn_if_key_file_is_readable_by_others(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.permissions().mode() & 0o077 != 0
+    {
+        eprintln!(
+            "warning: key file {} is readable by other users; run: chmod 600 {}",
+            path.display(),
+            path.display()
+        );
+    }
+}
+
 /// Read the master key from a file.
 ///
 /// Only the trailing newline is stripped. Spaces are legitimate password
 /// material and must survive, so a key written by `printf` behaves identically
 /// to one written by `echo`.
 pub fn read_key_file(path: &Path) -> Result<Zeroizing<String>> {
+    #[cfg(unix)]
+    warn_if_key_file_is_readable_by_others(path);
+
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read key file {}", path.display()))?;
     let key = raw.strip_suffix('\n').unwrap_or(&raw);

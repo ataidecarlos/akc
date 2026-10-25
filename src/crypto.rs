@@ -53,8 +53,10 @@ pub const PARAM_P_COST: u32 = 4;
 
 // Bounds enforced on KDF parameters read back from a file header. Without these
 // a hostile file could request a multi-gigabyte allocation and exhaust memory.
+// The ceiling is 256 MiB: high enough for a strong vault, low enough that a
+// crafted file cannot turn one failed open into a multi-gigabyte allocation.
 const MIN_M_COST: u32 = 8 * 1024;
-const MAX_M_COST: u32 = 1024 * 1024;
+const MAX_M_COST: u32 = 256 * 1024;
 const MIN_T_COST: u32 = 1;
 const MAX_T_COST: u32 = 16;
 const MIN_P_COST: u32 = 1;
@@ -120,8 +122,23 @@ fn make_cipher(key: &mut [u8; KEY_LEN]) -> Aes256Gcm {
     cipher
 }
 
+/// Marker for a GCM authentication failure.
+///
+/// The CLI downcasts to it so a wrong key gets its own exit code, which a
+/// script can tell apart from a missing file or a missing secret.
+#[derive(Debug)]
+pub(crate) struct AuthError;
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("wrong password or corrupted file")
+    }
+}
+
+impl std::error::Error for AuthError {}
+
 fn auth_failure() -> anyhow::Error {
-    anyhow::anyhow!("wrong password or corrupted file")
+    anyhow::Error::new(AuthError)
 }
 
 pub fn encrypt_payload_with_params(
@@ -169,6 +186,13 @@ pub fn read_params(data: &[u8]) -> anyhow::Result<KdfParams> {
     if is_legacy(data) {
         return Ok(KdfParams::DEFAULT);
     }
+    // A file that starts with the magic but is shorter than a header must fail
+    // here: `read_u32` would otherwise index past the end and panic. A
+    // truncated cloud-sync file is exactly this shape.
+    ensure!(
+        data.len() >= HEADER_LEN,
+        "file is truncated or not a keychain file"
+    );
     let params = KdfParams {
         m_cost: read_u32(data, OFF_M_COST),
         t_cost: read_u32(data, OFF_T_COST),
@@ -408,5 +432,31 @@ mod tests {
     #[test]
     fn short_file_is_rejected_not_misread_as_legacy() {
         assert!(decrypt_payload(&[0u8; 4], "pass").is_err());
+    }
+
+    /// Regression: a file shorter than a header but starting with the magic
+    /// used to index past the end of the slice and panic. A truncated download
+    /// or an unfinished cloud sync is exactly this shape.
+    #[test]
+    fn short_magic_prefixed_file_is_rejected_without_panicking() {
+        for len in [MAGIC_LEN, MAGIC_LEN + 1, HEADER_LEN - 1] {
+            let mut data = [0u8; HEADER_LEN];
+            data[..MAGIC_LEN].copy_from_slice(MAGIC);
+            let data = &data[..len];
+            let err = read_params(data).unwrap_err().to_string();
+            assert!(err.contains("truncated"), "{len} bytes: {err}");
+            assert!(decrypt_payload(data, "pass").is_err());
+        }
+    }
+
+    /// Bounds exist so a hostile header cannot demand an unbounded allocation.
+    #[test]
+    fn one_gib_memory_cost_is_rejected() {
+        let params = KdfParams {
+            m_cost: 1024 * 1024,
+            t_cost: 3,
+            p_cost: 4,
+        };
+        assert!(params.validate().is_err());
     }
 }

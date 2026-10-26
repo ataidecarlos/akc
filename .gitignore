@@ -16,3 +16,8 @@ ruvector.db
 # Vera code-search index (local semantic search). Never commit the index.
 .vera/
 .vera.lock
+
+# Cloudflare Worker tooling.
+node_modules/
+.wrangler/
+worker/.dev.vars

@@ -1,0 +1,9 @@
+name = "akc-sync"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# `wrangler d1 create akc-sync` prints the id; paste it here.
+[[d1_databases]]
+binding = "DB"
+database_name = "akc-sync"
+database_id = "3a109678-cb7a-4e27-b368-68b16a252c4c"

@@ -57,6 +57,16 @@ impl Keychain {
         }
     }
 
+    /// Test-only: a vault with cheap KDF costs, so tests that open a vault many
+    /// times do not spend their runtime in Argon2.
+    #[cfg(test)]
+    pub fn new_with_params(params: KdfParams) -> Self {
+        Keychain {
+            store: Store::empty(),
+            params,
+        }
+    }
+
     pub fn load(path: &Path, password: &str) -> anyhow::Result<Self> {
         let mut bytes = Vec::new();
         std::fs::File::open(path)

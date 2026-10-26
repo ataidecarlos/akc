@@ -156,6 +156,9 @@ printf '%s' "$TOKEN" | akc api_key --set
 | `--delete NAME...` | remove (aliases: `--drop`, `--remove`, `--rm`) |
 | `--init` | create an empty keychain |
 | `--rotate` | re-key under a new master key |
+| `--sync` | pull, merge, and push changes with the sync server |
+| `--sync-init` | create a sync vault and print its token |
+| `--sync-join TOKEN` | adopt an existing sync vault on this machine |
 | `--update` | check for and install updates |
 | `--json` | machine-readable output for reads |
 | `--keychain PATH` | override the configured keychain |
@@ -279,6 +282,46 @@ The shared master key is a bearer secret with no expiry. Anyone who has ever hel
 it can decrypt every secret in the repository's history, including ones deleted
 since, so handing it over cannot be taken back. Rotating it protects only what is
 written afterwards.
+
+### Cloud sync
+
+Sync keeps one vault across machines through a server that only ever sees
+ciphertext. It needs Cloudflare's free tier: one Worker and one D1 database. The
+deployment is in [`worker/README.md`](worker/README.md), and the whole server is
+around a hundred lines.
+
+```bash
+# First machine: create the vault key and print the only copy of the token
+akc --sync-init --sync-url https://akc-sync.you.workers.dev
+
+# Every other machine: adopt the token
+akc --sync-join 'akcsync://akc-sync.you.workers.dev#<64 hex chars>'
+
+# Exchange changes (pull, merge, push)
+akc --sync
+```
+
+The vault file stays exactly what it was: sync decrypts it in memory, merges,
+and saves it again. `--sync` is explicit, so no command ever blocks on the
+network; run it when you want, or from a scheduled task.
+
+- **The token is the vault.** `--sync-init` derives the encryption key, the item
+  ids, and the bearer token from one 32-byte secret. It is printed once and
+  never uploaded in a recoverable form. Lose it and the synced copy is
+  unreadable; the local vault is unaffected.
+- **The server learns nothing.** Entries are AES-256-GCM blobs keyed by a PRF of
+  the secret name. The server sees sizes, timestamps, and how often you sync.
+- **Rotation stays local.** `--rotate` changes only the vault password. The sync
+  key is independent, so no re-upload and no other device is disturbed.
+- **Conflicts lose nothing.** If the same secret changed on two machines, the
+  server's value keeps the name and the other is kept as
+  `name (conflict <date>)`. Both machines converge on the same winner.
+- **Deletes propagate as tombstones** and are kept forever: they are a few dozen
+  bytes, and a machine that was offline for months still converges.
+
+The sync credential lives in `~/.config/akc/sync-key` (0600) by default, or in
+`AKC_SYNC_KEY`. The cursor and hashes live beside it in `sync-state.json`. Use
+`sync_key_file` in the config to move the key.
 
 ### Upgrade
 

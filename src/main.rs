@@ -9,9 +9,10 @@ mod config;
 mod crypto;
 mod password;
 mod storage;
+mod sync;
 mod upgrade;
 
-use config::{Config, default_key_file, read_key_file};
+use config::{Config, default_key_file, default_sync_key_file, read_key_file};
 use storage::{Keychain, Lock};
 
 #[derive(Parser)]
@@ -19,7 +20,17 @@ use storage::{Keychain, Lock};
     name = "akc",
     version,
     about = "Minimal encrypted keychain (akc): fetch a secret from a single portable file",
-    group(ArgGroup::new("command").args(["init", "set", "delete", "list", "rotate", "update"]))
+    group(ArgGroup::new("command").args([
+        "init",
+        "set",
+        "delete",
+        "list",
+        "rotate",
+        "update",
+        "sync",
+        "sync_init",
+        "sync_join"
+    ]))
 )]
 struct Cli {
     /// Secret name(s). With no command flag their values are printed.
@@ -89,6 +100,22 @@ struct Cli {
     #[arg(long)]
     update: bool,
 
+    /// Pull changes from the sync server, merge them, and push local changes
+    #[arg(long)]
+    sync: bool,
+
+    /// Create a sync key for this machine and print the token to share
+    #[arg(long)]
+    sync_init: bool,
+
+    /// Start syncing with a vault using a token from `--sync-init`
+    #[arg(long, value_name = "TOKEN")]
+    sync_join: Option<String>,
+
+    /// Sync server URL, for --sync-init
+    #[arg(long, env = "AKC_SYNC_URL", hide_env_values = true, value_name = "URL")]
+    sync_url: Option<String>,
+
     /// With --update or --init: proceed even though it discards something
     #[arg(long)]
     force: bool,
@@ -116,6 +143,16 @@ fn run() -> Result<()> {
     if cli.update {
         ensure!(cli.names.is_empty(), "--update does not take secret names");
         return upgrade::run(cli.force, cli.yes, cli.to.as_deref());
+    }
+
+    // Sync setup needs no vault and no master key: it only writes a credential.
+    if let Some(token) = cli.sync_join.as_deref() {
+        ensure!(cli.names.is_empty(), "--sync-join does not take secret names");
+        return cmd_sync_join(token, &config, cli.force);
+    }
+    if cli.sync_init {
+        ensure!(cli.names.is_empty(), "--sync-init does not take secret names");
+        return cmd_sync_init(cli.sync_url.as_deref(), &config, cli.force);
     }
 
     let file = cli.keychain.clone().or(config.keychain.clone()).context(
@@ -148,6 +185,10 @@ fn run() -> Result<()> {
         let replacement =
             resolve_new_key(cli.new_password.as_deref(), cli.new_key_file.as_deref())?;
         return cmd_rotate(&file, &password, &replacement);
+    }
+    if cli.sync {
+        ensure!(cli.names.is_empty(), "--sync does not take secret names");
+        return cmd_sync(&file, &password, &config);
     }
     if cli.list {
         return cmd_list(&file, &password, &cli.names, cli.json);
@@ -391,6 +432,75 @@ fn cmd_delete(file: &Path, password: &str, names: &[String]) -> Result<()> {
         }
         Ok(())
     })?;
+    Ok(())
+}
+
+/// The sync credential for this machine. The environment wins so CI and
+/// agents can sync without writing a file.
+fn resolve_sync_key(config: &Config) -> Result<sync::SyncKey> {
+    if let Some(token) = std::env::var_os("AKC_SYNC_KEY") {
+        return sync::SyncKey::parse(&token.to_string_lossy());
+    }
+    let path = config
+        .sync_key_file
+        .clone()
+        .or_else(default_sync_key_file)
+        .context("cannot determine the config directory")?;
+    ensure!(
+        path.exists(),
+        "no sync key configured: run `akc --sync-init --sync-url URL` here, \
+         or `akc --sync-join TOKEN` on this machine"
+    );
+    sync::read_key_file(&path)
+}
+
+/// Create a new sync vault and write this machine's credential.
+///
+/// The token is printed once and is the only copy: it decrypts the synced data,
+/// so it is as sensitive as the vault password.
+fn cmd_sync_init(url: Option<&str>, config: &Config, force: bool) -> Result<()> {
+    let url = url.context("--sync-init needs --sync-url (or AKC_SYNC_URL)")?;
+    let key = sync::SyncKey::create(url)?;
+    let path = config
+        .sync_key_file
+        .clone()
+        .or_else(default_sync_key_file)
+        .context("cannot determine the config directory")?;
+    sync::write_key_file(&path, &key, force)?;
+    // A fresh key starts a fresh cursor; a stale one would skip the history.
+    let _ = std::fs::remove_file(sync::default_state_path()?);
+
+    println!("Wrote sync key to {}", path.display());
+    println!("Vault: {}", key.vault_id());
+    println!("Token (share it, keep it secret -- it decrypts the synced copy):");
+    println!("{}", key.token());
+    Ok(())
+}
+
+/// Adopt an existing vault's credential on this machine.
+fn cmd_sync_join(token: &str, config: &Config, force: bool) -> Result<()> {
+    let key = sync::SyncKey::parse(token)?;
+    let path = config
+        .sync_key_file
+        .clone()
+        .or_else(default_sync_key_file)
+        .context("cannot determine the config directory")?;
+    sync::write_key_file(&path, &key, force)?;
+    let _ = std::fs::remove_file(sync::default_state_path()?);
+
+    println!("Joined {} at {}", key.vault_id(), key.endpoint);
+    println!("Wrote sync key to {}", path.display());
+    println!("Run `akc --sync` to pull the secrets into this keychain.");
+    Ok(())
+}
+
+fn cmd_sync(file: &Path, password: &str, config: &Config) -> Result<()> {
+    ensure!(file.exists(), "keychain not found: {}", file.display());
+    let key = resolve_sync_key(config)?;
+    let backend = sync::HttpBackend::new(&key)?;
+    let state = sync::default_state_path()?;
+    let summary = sync::run(file, password, &key, &backend, &state)?;
+    println!("{summary}");
     Ok(())
 }
 
@@ -729,6 +839,7 @@ mod tests {
         let config = Config {
             keychain: None,
             key_file: Some(key_path),
+            sync_key_file: None,
         };
         let key = resolve_key(None, None, &config).unwrap();
         assert_eq!(key.as_str(), "from-file");

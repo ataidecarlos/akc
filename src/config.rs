@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 pub struct Config {
     pub keychain: Option<PathBuf>,
     pub key_file: Option<PathBuf>,
+    pub sync_key_file: Option<PathBuf>,
 }
 
 impl Config {
@@ -55,6 +56,7 @@ impl Config {
             match key.trim() {
                 "keychain" => config.keychain = Some(value),
                 "key_file" => config.key_file = Some(value),
+                "sync_key_file" => config.sync_key_file = Some(value),
                 other => bail!("{}: unknown setting `{other}`", at()),
             }
         }
@@ -88,6 +90,11 @@ pub fn config_path() -> Option<PathBuf> {
 /// The key file used when nothing else names one.
 pub fn default_key_file() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("key"))
+}
+
+/// The sync credential used when nothing else names one.
+pub fn default_sync_key_file() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("sync-key"))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -163,6 +170,18 @@ mod tests {
         let config = Config::load_from(&path).unwrap();
         assert_eq!(config.keychain, Some(PathBuf::from("/v.akc")));
         assert_eq!(config.key_file, Some(PathBuf::from("/k")));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn reads_the_sync_key_file() {
+        let Some(home) = home_dir() else { return };
+        let path = write_config("sync_key_file = ~/.config/akc/sync-key\n");
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(
+            config.sync_key_file,
+            Some(home.join(".config/akc/sync-key"))
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

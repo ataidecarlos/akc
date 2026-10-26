@@ -5,6 +5,21 @@ All notable changes to akc are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`--sync`, `--sync-init`, `--sync-join`.** Optional encrypted sync through a
+  server that only stores ciphertext. One Cloudflare Worker and one D1 database
+  deploy in minutes on the free plan; the server code is in `worker/`.
+- **`sync_key_file`** (default `~/.config/akc/sync-key`) and `AKC_SYNC_KEY`, so a
+  machine can sync without a config entry.
+
+The vault format is unchanged: sync decrypts the current container in memory,
+merges per-secret changes, and saves it again, so existing vaults need no
+migration. A sync credential is independent of the master key, which keeps
+`--rotate` local and free.
+
 ## [4.0.0] - 2026-10-15
 
 The command line is redesigned. This is a breaking release; the migration table is

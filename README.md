@@ -92,9 +92,10 @@ A release must carry **every** asset: `--update` reads `releases/latest` and the
 downloads the file for the current platform, so a release missing one turns
 `akc --update` on that platform into a 404 rather than a no-op. For the same
 reason, `releases/latest` must only ever point at a folder holding all five.
-Partial folders are build archives: `releases/20261026_1/` currently holds only
-`akc-windows-aarch64.exe` (Windows ARM64), and the rest arrive from builds on
-the other machines before `releases/latest` moves.
+Partial folders are build archives: `releases/20261026_1/` currently holds
+`akc-windows-aarch64.exe` (Windows ARM64) and `akc-linux-aarch64` (Linux ARM64,
+static musl); the other three arrive from builds on the other machines before
+`releases/latest` moves.
 
 Then produce the checksum file:
 

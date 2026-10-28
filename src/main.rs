@@ -12,7 +12,7 @@ mod storage;
 mod sync;
 mod upgrade;
 
-use config::{Config, default_key_file, default_sync_key_file, read_key_file};
+use config::{Config, default_key_file, read_key_file};
 use storage::{Keychain, Lock};
 
 #[derive(Parser)]
@@ -27,9 +27,7 @@ use storage::{Keychain, Lock};
         "list",
         "rotate",
         "update",
-        "sync",
-        "sync_init",
-        "sync_join"
+        "sync"
     ]))
 )]
 struct Cli {
@@ -104,16 +102,14 @@ struct Cli {
     #[arg(long)]
     sync: bool,
 
-    /// Create a sync key for this machine and print the token to share
-    #[arg(long)]
-    sync_init: bool,
-
-    /// Start syncing with a vault using a token from `--sync-init`
-    #[arg(long, value_name = "TOKEN")]
-    sync_join: Option<String>,
-
-    /// Sync server URL, for --sync-init
-    #[arg(long, env = "AKC_SYNC_URL", hide_env_values = true, value_name = "URL")]
+    /// Sync server URL (defaults to the config file)
+    #[arg(
+        long,
+        global = true,
+        env = "AKC_SYNC_URL",
+        hide_env_values = true,
+        value_name = "URL"
+    )]
     sync_url: Option<String>,
 
     /// With --update or --init: proceed even though it discards something
@@ -145,16 +141,6 @@ fn run() -> Result<()> {
         return upgrade::run(cli.force, cli.yes, cli.to.as_deref());
     }
 
-    // Sync setup needs no vault and no master key: it only writes a credential.
-    if let Some(token) = cli.sync_join.as_deref() {
-        ensure!(cli.names.is_empty(), "--sync-join does not take secret names");
-        return cmd_sync_join(token, &config, cli.force);
-    }
-    if cli.sync_init {
-        ensure!(cli.names.is_empty(), "--sync-init does not take secret names");
-        return cmd_sync_init(cli.sync_url.as_deref(), &config, cli.force);
-    }
-
     let file = cli.keychain.clone().or(config.keychain.clone()).context(
         "no keychain configured: set `keychain` in ~/.config/akc/config, or pass --keychain",
     )?;
@@ -184,11 +170,20 @@ fn run() -> Result<()> {
         ensure!(cli.names.is_empty(), "--rotate does not take secret names");
         let replacement =
             resolve_new_key(cli.new_password.as_deref(), cli.new_key_file.as_deref())?;
-        return cmd_rotate(&file, &password, &replacement);
+        return cmd_rotate(
+            &file,
+            &password,
+            &replacement,
+            resolve_sync_url(cli.sync_url.as_deref(), &config).as_deref(),
+        );
     }
     if cli.sync {
         ensure!(cli.names.is_empty(), "--sync does not take secret names");
-        return cmd_sync(&file, &password, &config);
+        let url = resolve_sync_url(cli.sync_url.as_deref(), &config).context(
+            "no sync server configured: set `sync_url` in ~/.config/akc/config, \
+             or pass --sync-url",
+        )?;
+        return cmd_sync(&file, &password, &url);
     }
     if cli.list {
         return cmd_list(&file, &password, &cli.names, cli.json);
@@ -337,11 +332,57 @@ fn cmd_init(file: &Path, force: bool, password: &str) -> Result<()> {
 ///
 /// Note what this cannot do: if the vault is committed to git, the old key
 /// still opens every commit made before the rotation.
-fn cmd_rotate(file: &Path, current: &str, replacement: &str) -> Result<()> {
+fn cmd_rotate(file: &Path, current: &str, replacement: &str, sync_url: Option<&str>) -> Result<()> {
     ensure!(file.exists(), "keychain not found: {}", file.display());
-    let _lock = Lock::acquire(file)?;
+    let lock = Lock::acquire(file)?;
     let kc = Keychain::load(file, current)?;
-    rekey(file, &kc, replacement, &mut std::io::stdout())
+    rekey(file, &kc, replacement, &mut std::io::stdout())?;
+    // `sync::run` takes this lock itself; holding it here would deadlock.
+    drop(lock);
+
+    // The sync identity is derived from the master key, so a rotation changes
+    // it. The copy the retired key opened must go -- otherwise the password the
+    // user just retired still decrypts an online copy -- and the vault must be
+    // published again under the new identity.
+    if let Some(url) = sync_url {
+        match republish_sync(file, current, replacement, url) {
+            Ok(note) => println!("{note}"),
+            Err(err) => eprintln!(
+                "warning: the synced copy was not republished: {err:#}\n         \
+                 run `akc --sync` to publish the vault under the new key"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Replace the remote vault the old key opened with one the new key opens.
+fn republish_sync(
+    file: &Path,
+    old_password: &str,
+    new_password: &str,
+    url: &str,
+) -> Result<String> {
+    use sync::Backend as _;
+    let new = sync::SyncKey::from_master(new_password, url)?;
+    let summary = sync::run(
+        file,
+        new_password,
+        &new,
+        &sync::HttpBackend::new(&new)?,
+        &sync::default_state_path()?,
+    )?;
+    // Delete only after the new copy is up, so a failed upload cannot leave the
+    // vault with no online copy at all.
+    let forgotten = sync::SyncKey::from_master(old_password, url)
+        .and_then(|old| sync::HttpBackend::new(&old)?.forget(&old.vault_id()));
+    let mut note = format!("Re-uploaded the synced copy under the new key ({summary})");
+    if let Err(err) = forgotten {
+        note.push_str(&format!(
+            "\nwarning: the copy under the previous key could not be deleted: {err:#}"
+        ));
+    }
+    Ok(note)
 }
 
 /// Back up the vault, then rewrite it under `new_password`.
@@ -435,68 +476,13 @@ fn cmd_delete(file: &Path, password: &str, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The sync credential for this machine. The environment wins so CI and
-/// agents can sync without writing a file.
-fn resolve_sync_key(config: &Config) -> Result<sync::SyncKey> {
-    if let Some(token) = std::env::var_os("AKC_SYNC_KEY") {
-        return sync::SyncKey::parse(&token.to_string_lossy());
-    }
-    let path = config
-        .sync_key_file
-        .clone()
-        .or_else(default_sync_key_file)
-        .context("cannot determine the config directory")?;
-    ensure!(
-        path.exists(),
-        "no sync key configured: run `akc --sync-init --sync-url URL` here, \
-         or `akc --sync-join TOKEN` on this machine"
-    );
-    sync::read_key_file(&path)
+/// The sync server URL. The environment and flag win over the config.
+fn resolve_sync_url(flag: Option<&str>, config: &Config) -> Option<String> {
+    flag.map(str::to_string).or_else(|| config.sync_url.clone())
 }
 
-/// Create a new sync vault and write this machine's credential.
-///
-/// The token is printed once and is the only copy: it decrypts the synced data,
-/// so it is as sensitive as the vault password.
-fn cmd_sync_init(url: Option<&str>, config: &Config, force: bool) -> Result<()> {
-    let url = url.context("--sync-init needs --sync-url (or AKC_SYNC_URL)")?;
-    let key = sync::SyncKey::create(url)?;
-    let path = config
-        .sync_key_file
-        .clone()
-        .or_else(default_sync_key_file)
-        .context("cannot determine the config directory")?;
-    sync::write_key_file(&path, &key, force)?;
-    // A fresh key starts a fresh cursor; a stale one would skip the history.
-    let _ = std::fs::remove_file(sync::default_state_path()?);
-
-    println!("Wrote sync key to {}", path.display());
-    println!("Vault: {}", key.vault_id());
-    println!("Token (share it, keep it secret -- it decrypts the synced copy):");
-    println!("{}", key.token());
-    Ok(())
-}
-
-/// Adopt an existing vault's credential on this machine.
-fn cmd_sync_join(token: &str, config: &Config, force: bool) -> Result<()> {
-    let key = sync::SyncKey::parse(token)?;
-    let path = config
-        .sync_key_file
-        .clone()
-        .or_else(default_sync_key_file)
-        .context("cannot determine the config directory")?;
-    sync::write_key_file(&path, &key, force)?;
-    let _ = std::fs::remove_file(sync::default_state_path()?);
-
-    println!("Joined {} at {}", key.vault_id(), key.endpoint);
-    println!("Wrote sync key to {}", path.display());
-    println!("Run `akc --sync` to pull the secrets into this keychain.");
-    Ok(())
-}
-
-fn cmd_sync(file: &Path, password: &str, config: &Config) -> Result<()> {
-    ensure!(file.exists(), "keychain not found: {}", file.display());
-    let key = resolve_sync_key(config)?;
+fn cmd_sync(file: &Path, password: &str, url: &str) -> Result<()> {
+    let key = sync::SyncKey::from_master(password, url)?;
     let backend = sync::HttpBackend::new(&key)?;
     let state = sync::default_state_path()?;
     let summary = sync::run(file, password, &key, &backend, &state)?;
@@ -770,7 +756,7 @@ mod tests {
         cmd_set(&file, "keep", Some("me"), "oldpass").unwrap();
         cmd_set(&file, "other", Some("value"), "oldpass").unwrap();
 
-        cmd_rotate(&file, "oldpass", "newpass").unwrap();
+        cmd_rotate(&file, "oldpass", "newpass", None).unwrap();
 
         let reloaded = Keychain::load(&file, "newpass").unwrap();
         assert_eq!(reloaded.get("keep").map(String::as_str), Some("me"));
@@ -789,7 +775,9 @@ mod tests {
         cmd_init(&file, false, "oldpass").unwrap();
         cmd_set(&file, "keep", Some("me"), "oldpass").unwrap();
 
-        let err = cmd_rotate(&file, "wrong", "newpass").unwrap_err().to_string();
+        let err = cmd_rotate(&file, "wrong", "newpass", None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("wrong password"), "{err}");
 
         assert!(Keychain::load(&file, "oldpass").is_ok());
@@ -800,7 +788,7 @@ mod tests {
     #[test]
     fn rotate_requires_an_existing_keychain() {
         let dir = temp_dir();
-        let err = cmd_rotate(&dir.join("missing.akc"), "pw", "pw")
+        let err = cmd_rotate(&dir.join("missing.akc"), "pw", "pw", None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("not found"), "{err}");
@@ -839,7 +827,7 @@ mod tests {
         let config = Config {
             keychain: None,
             key_file: Some(key_path),
-            sync_key_file: None,
+            sync_url: None,
         };
         let key = resolve_key(None, None, &config).unwrap();
         assert_eq!(key.as_str(), "from-file");

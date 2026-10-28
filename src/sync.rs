@@ -4,10 +4,14 @@
 //! memory, merges per-secret changes, and saves it again. So there is no new
 //! file format, no migration, and every existing command behaves as before.
 //!
+//! The sync identity is derived from the master key, so there is no second
+//! secret to carry between machines: the password (or key file) that opens the
+//! vault also opens its online backup. Nothing is stored on the machine besides
+//! the server URL.
+//!
 //! The server only ever holds AES-256-GCM blobs keyed by a PRF of the secret
-//! name, so it learns neither names nor values. One high-entropy string,
-//! `akcsync://host#<hex>`, is the whole credential: the entry key, the item ids,
-//! and the bearer token are all derived from it.
+//! name, so it learns neither names nor values. The entry key, the item ids,
+//! and the bearer token are all subkeys of the master key.
 //!
 //! Merge rules, in order:
 //! - Remote wins the name; a differing local value is kept as
@@ -33,74 +37,46 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::config;
+use crate::crypto;
 use crate::storage::{Keychain, Lock};
 
-pub const TOKEN_SCHEME: &str = "akcsync://";
 const NONCE_LEN: usize = 12;
 const ENTRY_TAG_LEN: usize = 16;
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// Must match `MAX_PUTS` in the Worker: one request carries at most this many.
 const MAX_PUTS_PER_REQUEST: usize = 500;
 
-/// A sync credential: endpoint plus 32 random bytes.
+/// A sync identity: the server endpoint plus 32 bytes derived from the master
+/// key. Two machines with the same master key compute the same identity, which
+/// is what makes the online backup reachable with the password alone.
 pub struct SyncKey {
     pub endpoint: String,
     secret: Zeroizing<[u8; 32]>,
 }
 
 impl SyncKey {
-    /// Generate a key for a new vault. The secret is the only thing that can
-    /// decrypt the synced copy, so it must come from the OS RNG.
-    pub fn create(endpoint: &str) -> Result<Self> {
-        let endpoint = validate_endpoint(endpoint)?;
-        let mut secret = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut secret);
-        Ok(Self::from_secret(&endpoint, secret))
-    }
-
-    /// Test and import helper: the caller supplies the secret.
-    pub fn from_secret(endpoint: &str, secret: [u8; 32]) -> Self {
-        SyncKey {
-            endpoint: endpoint.trim_end_matches('/').to_string(),
-            secret: Zeroizing::new(secret),
-        }
-    }
-
-    pub fn parse(token: &str) -> Result<Self> {
-        let token = token.trim();
-        let rest = token
-            .strip_prefix(TOKEN_SCHEME)
-            .with_context(|| format!("sync key must start with {TOKEN_SCHEME}"))?;
-        let (host, secret) = rest
-            .split_once('#')
-            .context("sync key is missing its #secret part")?;
-        // Tokens carry a bare host. Accept a full URL too, so a hand-written or
-        // older token does not silently become `https://https://...`.
-        let endpoint = if host.starts_with("http://") || host.starts_with("https://") {
-            host.to_string()
-        } else if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
-            format!("http://{host}")
-        } else {
-            format!("https://{host}")
-        };
-        let endpoint = validate_endpoint(&endpoint)?;
-        let bytes = hex::decode(secret.trim()).context("sync key secret is not hex")?;
-        ensure!(bytes.len() == 32, "sync key secret must be 32 bytes");
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&bytes);
-        Ok(SyncKey {
-            endpoint,
-            secret: Zeroizing::new(key),
+    pub fn from_master(password: &str, endpoint: &str) -> Result<Self> {
+        Ok(Self {
+            endpoint: validate_endpoint(endpoint)?,
+            secret: Zeroizing::new(crypto::derive_sync_key(password)?),
         })
     }
 
-    pub fn token(&self) -> String {
-        let host = self
-            .endpoint
-            .strip_prefix("https://")
-            .or_else(|| self.endpoint.strip_prefix("http://"))
-            .unwrap_or(&self.endpoint);
-        format!("{TOKEN_SCHEME}{host}#{}", hex::encode(&*self.secret))
+    /// Cheap-cost construction for tests, where the real derivation cost would
+    /// dominate the runtime.
+    #[cfg(test)]
+    pub fn for_test(password: &str, endpoint: &str) -> Self {
+        let params = crypto::KdfParams {
+            m_cost: 8 * 1024,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        SyncKey {
+            endpoint: validate_endpoint(endpoint).unwrap(),
+            secret: Zeroizing::new(
+                crypto::derive_sync_key_with(password, params).expect("cheap derivation"),
+            ),
+        }
     }
 
     /// What goes on the wire as the bearer token. It is a one-way subkey, so a
@@ -253,6 +229,11 @@ pub struct Response {
 /// memory for tests, which keeps the merge testable without a server.
 pub trait Backend {
     fn sync(&self, vault: &str, since: u64, puts: Vec<Put>) -> Result<Response>;
+
+    /// Drop everything the server holds for this vault. Used after `--rotate`:
+    /// the identity follows the master key, so the retired password must not
+    /// keep a readable online copy.
+    fn forget(&self, vault: &str) -> Result<()>;
 }
 
 pub struct HttpBackend {
@@ -284,6 +265,13 @@ impl Backend for HttpBackend {
             .send()
             .with_context(|| format!("cannot reach the sync server at {}", self.endpoint))?;
         let status = response.status();
+        if status == reqwest::StatusCode::GONE {
+            bail!(
+                "the synced vault was retired by a key rotation on another machine: \
+                 run `akc --rotate --new-password <new>` here to move this machine \
+                 to the new key, then `akc --sync`"
+            );
+        }
         if !status.is_success() {
             let body = response.text().unwrap_or_default();
             bail!("sync server returned {status}: {}", body.trim());
@@ -292,10 +280,30 @@ impl Backend for HttpBackend {
             .json()
             .context("sync server returned an unreadable response")
     }
+
+    fn forget(&self, _vault: &str) -> Result<()> {
+        let response = self
+            .client
+            .delete(format!("{}/v1/sync", self.endpoint))
+            .bearer_auth(&self.token)
+            .send()
+            .with_context(|| format!("cannot reach the sync server at {}", self.endpoint))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            bail!("sync server returned {status}: {}", body.trim());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
 struct State {
+    /// Which sync identity this cursor belongs to. A cursor is a sequence
+    /// number in one server-side vault, so reusing it after the identity
+    /// changes (a rotation, or an older build's token) would skip changes.
+    #[serde(default)]
+    vault: Option<String>,
     /// Highest server sequence already seen.
     cursor: u64,
     /// Item id -> value hash last seen both locally and on the server. Only
@@ -374,15 +382,36 @@ pub fn run(
     state_path: &Path,
 ) -> Result<Summary> {
     let _lock = Lock::acquire(file)?;
-    let mut keychain = Keychain::load(file, password)?;
-    let mut state = State::load(state_path)?;
-    let mut summary = Summary::default();
+    // A machine with no vault yet is how a second device joins: the master key
+    // is all it has, so the pull creates the file.
+    let created = !file.exists();
+    let mut keychain = if created {
+        Keychain::new()
+    } else {
+        Keychain::load(file, password)?
+    };
     let vault = key.vault_id();
+    let mut state = State::load(state_path)?;
+    if state.vault.as_deref() != Some(vault.as_str()) {
+        state = State::default();
+        state.vault = Some(vault.clone());
+    }
+    let mut summary = Summary::default();
 
     let pulled = backend.sync(&vault, state.cursor, Vec::new())?;
+    // An empty download on a machine with no vault means the password (or the
+    // URL) does not name an existing vault. Creating a new empty one here would
+    // turn a typo into a silent, empty "backup".
+    if created && pulled.changes.is_empty() {
+        bail!(
+            "no vault found at {} for this master key: check the password and \
+             sync_url, or run `akc --init` to start a new one",
+            key.endpoint
+        );
+    }
     let mut changed = apply_changes(&mut keychain, key, &mut state, &pulled, &mut summary)?;
     state.cursor = state.cursor.max(pulled.seq);
-    if changed {
+    if changed || created {
         keychain.save(file, password, false)?;
     }
     state.save(state_path)?;
@@ -402,7 +431,6 @@ pub fn run(
         state.save(state_path)?;
         if changed {
             keychain.save(file, password, false)?;
-            changed = false;
         }
     }
     Ok(summary)
@@ -571,37 +599,6 @@ pub fn default_state_path() -> Result<PathBuf> {
         .context("cannot determine the config directory")
 }
 
-pub fn read_key_file(path: &Path) -> Result<SyncKey> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read sync key file {}", path.display()))?;
-    SyncKey::parse(&text)
-}
-
-pub fn write_key_file(path: &Path, key: &SyncKey, force: bool) -> Result<()> {
-    if path.exists() && !force {
-        bail!(
-            "{} already exists: pass --force to replace this machine's sync key",
-            path.display()
-        );
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("cannot write sync key file {}", path.display()))?;
-    writeln!(file, "{}", key.token())?;
-    file.sync_all()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,6 +622,8 @@ mod tests {
     #[derive(Default)]
     struct Memory {
         vaults: Mutex<HashMap<String, Vault>>,
+        /// Mirrors the Worker's `vaults` table: identities retired by a rotation.
+        superseded: Mutex<std::collections::HashSet<String>>,
     }
 
     impl Memory {
@@ -658,6 +657,10 @@ mod tests {
             anyhow::ensure!(
                 puts.len() <= MAX_PUTS_PER_REQUEST,
                 "too many entries in one request"
+            );
+            anyhow::ensure!(
+                !self.superseded.lock().unwrap().contains(vault),
+                "the synced vault was retired by a key rotation on another machine"
             );
             let mut vaults = self.vaults.lock().unwrap();
             let entry = vaults.entry(vault.to_string()).or_default();
@@ -700,6 +703,15 @@ mod tests {
                 changes,
             })
         }
+
+        fn forget(&self, vault: &str) -> Result<()> {
+            self.vaults.lock().unwrap().remove(vault);
+            self.superseded
+                .lock()
+                .unwrap()
+                .insert(vault.to_string());
+            Ok(())
+        }
     }
 
     struct Device {
@@ -720,13 +732,15 @@ mod tests {
         dir
     }
 
-    fn device(dir: &Path, name: &str, secret: [u8; 32]) -> Device {
+    /// Every device that shares a master key shares the sync identity; that is
+    /// the whole point of deriving it from the password.
+    fn device(dir: &Path, name: &str, password: &str) -> Device {
         let base = dir.join(name);
         std::fs::create_dir_all(&base).unwrap();
         Device {
             vault: base.join("v.akc"),
             state: base.join("state.json"),
-            key: SyncKey::from_secret("https://sync.test", secret),
+            key: SyncKey::for_test(password, "https://sync.test"),
         }
     }
 
@@ -773,60 +787,32 @@ mod tests {
             .collect()
     }
 
-    // --- token ---
+    // --- identity ---
 
     #[test]
-    fn token_round_trips_through_parse() {
-        let key = SyncKey::from_secret("https://example.test", [7u8; 32]);
-        assert!(
-            key.token().starts_with("akcsync://example.test#"),
-            "the token must carry a bare host, not a second scheme: {}",
-            key.token()
-        );
-        let parsed = SyncKey::parse(&key.token()).unwrap();
-        assert_eq!(parsed.endpoint, "https://example.test");
-        assert_eq!(parsed.vault_id(), key.vault_id());
+    fn the_same_password_names_the_same_vault() {
+        let a = SyncKey::for_test("pass", "https://x.test");
+        let b = SyncKey::for_test("pass", "https://x.test/");
+        assert_eq!(a.vault_id(), b.vault_id());
     }
 
     #[test]
-    fn plain_http_is_rejected_except_on_localhost() {
-        // A bare host means https.
-        let parsed =
-            SyncKey::parse(&format!("{}example.test#{}", TOKEN_SCHEME, "00".repeat(32))).unwrap();
-        assert_eq!(parsed.endpoint, "https://example.test");
-        assert!(
-            SyncKey::parse(&format!(
-                "{}http://example.test#{}",
-                TOKEN_SCHEME,
-                "00".repeat(32)
-            ))
-            .is_err()
-        );
-        assert!(
-            SyncKey::parse(&format!(
-                "{}http://localhost:8787#{}",
-                TOKEN_SCHEME,
-                "00".repeat(32)
-            ))
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn a_short_secret_is_rejected() {
-        assert!(SyncKey::parse(&format!("{}https://x.test#abcd", TOKEN_SCHEME)).is_err());
-    }
-
-    #[test]
-    fn different_secrets_are_different_vaults() {
-        let a = SyncKey::from_secret("https://x.test", [1u8; 32]);
-        let b = SyncKey::from_secret("https://x.test", [2u8; 32]);
+    fn different_passwords_are_different_vaults() {
+        let a = SyncKey::for_test("one", "https://x.test");
+        let b = SyncKey::for_test("two", "https://x.test");
         assert_ne!(a.vault_id(), b.vault_id());
     }
 
     #[test]
+    fn plain_http_is_rejected_except_on_localhost() {
+        assert!(SyncKey::from_master("pass", "http://example.test").is_err());
+        assert!(SyncKey::from_master("pass", "http://localhost:8787").is_ok());
+        assert!(SyncKey::from_master("pass", "https://example.test").is_ok());
+    }
+
+    #[test]
     fn the_wire_token_is_not_the_encryption_key() {
-        let key = SyncKey::from_secret("https://x.test", [3u8; 32]);
+        let key = SyncKey::for_test("pass", "https://x.test");
         let auth = key.auth_token();
         assert_ne!(auth, hex::encode(&*key.secret));
         // The server hashes the bearer it receives; the client agrees.
@@ -836,37 +822,46 @@ mod tests {
         );
     }
 
+    // --- sync ---
+
+    /// The whole point of the derived identity: a machine with no vault file,
+    /// no token, and no state pulls everything with the master password alone.
     #[test]
-    fn key_files_round_trip_and_refuse_to_clobber() {
-        let dir = root("keyfile");
-        let path = dir.join("sync-key");
-        let key = SyncKey::from_secret("https://x.test", [5u8; 32]);
-        write_key_file(&path, &key, false).unwrap();
-        assert_eq!(read_key_file(&path).unwrap().vault_id(), key.vault_id());
-        assert!(write_key_file(&path, &key, false).is_err());
-        write_key_file(&path, &key, true).unwrap();
+    fn a_fresh_device_joins_with_the_password_alone() {
+        let dir = root("move");
+        let backend = Memory::default();
+        let a = device(&dir, "a", "pw");
+        let b = device(&dir, "b", "pw");
+        init(&a, "pw");
+        set(&a, "pw", "api_key", "sk-123");
+
+        let summary = sync(&a, "pw", &backend);
+        assert_eq!(summary.pushed, 1);
+
+        // B has no vault file at all.
+        assert!(!b.vault.exists());
+        sync(&b, "pw", &backend);
+        assert_eq!(get(&b, "pw", "api_key").as_deref(), Some("sk-123"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // --- sync ---
-
+    /// A typo in the password names a different vault, and an empty one. It must
+    /// not be created as a "successful" empty backup.
     #[test]
-    fn a_secret_moves_to_a_fresh_device() {
-        let dir = root("move");
+    fn a_fresh_device_with_the_wrong_password_creates_nothing() {
+        let dir = root("wrong-pw");
         let backend = Memory::default();
-        let a = device(&dir, "a", [1u8; 32]);
-        let b = device(&dir, "b", [1u8; 32]);
-        init(&a, "password-a");
-        init(&b, "password-b");
-        set(&a, "password-a", "api_key", "sk-123");
+        let a = device(&dir, "a", "pw");
+        let b = device(&dir, "b", "typo");
+        init(&a, "pw");
+        set(&a, "pw", "k", "v");
+        sync(&a, "pw", &backend);
 
-        let summary = sync(&a, "password-a", &backend);
-        assert_eq!(summary.pushed, 1);
-
-        sync(&b, "password-b", &backend);
-        assert_eq!(get(&b, "password-b", "api_key").as_deref(), Some("sk-123"));
-        // Device B keeps its own vault password: sync never carries the master key.
-        assert!(Keychain::load(&b.vault, "password-a").is_err());
+        let err = run(&b.vault, "typo", &b.key, &backend, &b.state)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no vault found"), "{err}");
+        assert!(!b.vault.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -874,7 +869,7 @@ mod tests {
     fn a_second_sync_is_a_no_op() {
         let dir = root("idempotent");
         let backend = Memory::default();
-        let a = device(&dir, "a", [1u8; 32]);
+        let a = device(&dir, "a", "pw");
         init(&a, "pw");
         set(&a, "pw", "k", "v");
 
@@ -888,8 +883,8 @@ mod tests {
     fn a_delete_propagates_and_stays_deleted() {
         let dir = root("delete");
         let backend = Memory::default();
-        let a = device(&dir, "a", [1u8; 32]);
-        let b = device(&dir, "b", [1u8; 32]);
+        let a = device(&dir, "a", "pw");
+        let b = device(&dir, "b", "pw");
         init(&a, "pw");
         init(&b, "pw");
         set(&a, "pw", "gone", "value");
@@ -915,8 +910,8 @@ mod tests {
     fn concurrent_edits_keep_both_values_and_converge() {
         let dir = root("conflict");
         let backend = Memory::default();
-        let a = device(&dir, "a", [1u8; 32]);
-        let b = device(&dir, "b", [1u8; 32]);
+        let a = device(&dir, "a", "pw");
+        let b = device(&dir, "b", "pw");
         init(&a, "pw");
         init(&b, "pw");
         set(&a, "pw", "k", "one");
@@ -966,8 +961,8 @@ mod tests {
     fn a_local_delete_beats_a_remote_edit() {
         let dir = root("delete-vs-edit");
         let backend = Memory::default();
-        let a = device(&dir, "a", [1u8; 32]);
-        let b = device(&dir, "b", [1u8; 32]);
+        let a = device(&dir, "a", "pw");
+        let b = device(&dir, "b", "pw");
         init(&a, "pw");
         init(&b, "pw");
         set(&a, "pw", "k", "one");
@@ -987,18 +982,18 @@ mod tests {
     }
 
     #[test]
-    fn a_different_secret_cannot_read_the_vault() {
+    fn a_different_password_cannot_read_the_vault() {
         let dir = root("isolation");
         let backend = Memory::default();
-        let a = device(&dir, "a", [1u8; 32]);
-        let stranger = device(&dir, "s", [9u8; 32]);
+        let a = device(&dir, "a", "pw");
+        let stranger = device(&dir, "s", "other");
         init(&a, "pw");
-        init(&stranger, "pw");
+        init(&stranger, "other");
         set(&a, "pw", "k", "secret");
 
         sync(&a, "pw", &backend);
-        sync(&stranger, "pw", &backend);
-        assert!(keys(&stranger, "pw").is_empty());
+        sync(&stranger, "other", &backend);
+        assert!(keys(&stranger, "other").is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1006,7 +1001,7 @@ mod tests {
     fn the_server_never_sees_names_or_values() {
         let dir = root("opaque");
         let backend = Memory::default();
-        let a = device(&dir, "a", [1u8; 32]);
+        let a = device(&dir, "a", "pw");
         init(&a, "pw");
         set(&a, "pw", "db_password", "hunter2");
         sync(&a, "pw", &backend);
@@ -1033,8 +1028,8 @@ mod tests {
     fn a_large_vault_is_pushed_in_batches() {
         let dir = root("batches");
         let backend = Memory::default();
-        let a = device(&dir, "a", [4u8; 32]);
-        let b = device(&dir, "b", [4u8; 32]);
+        let a = device(&dir, "a", "pw");
+        let b = device(&dir, "b", "pw");
         init(&a, "pw");
         init(&b, "pw");
 
@@ -1060,7 +1055,7 @@ mod tests {
     fn the_state_file_survives_a_round_trip() {
         let dir = root("state");
         let backend = Memory::default();
-        let a = device(&dir, "a", [1u8; 32]);
+        let a = device(&dir, "a", "pw");
         init(&a, "pw");
         set(&a, "pw", "k", "v");
         sync(&a, "pw", &backend);
@@ -1069,6 +1064,75 @@ mod tests {
         let state: State = serde_json::from_str(&text).unwrap();
         assert!(state.cursor > 0);
         assert_eq!(state.synced.len(), 1);
+        assert_eq!(state.vault.as_deref(), Some(a.key.vault_id().as_str()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// After a rotation the identity changes, so the old cursor (a sequence
+    /// number in a different server-side vault) must not be reused: it could
+    /// skip changes that arrived under the new identity.
+    #[test]
+    fn a_cursor_from_another_identity_is_discarded() {
+        let dir = root("identity");
+        let backend = Memory::default();
+        let a = device(&dir, "a", "new");
+        let sender = device(&dir, "s", "new");
+        init(&a, "new");
+        init(&sender, "new");
+        set(&sender, "new", "k", "v");
+        sync(&sender, "new", &backend);
+
+        // What a pre-rotation state file looks like: a cursor far ahead of this
+        // vault's sequence, and hashes under a key that no longer exists.
+        let stale = State {
+            vault: Some("previous-identity".to_string()),
+            cursor: 999,
+            synced: std::collections::BTreeMap::from([("old-id".to_string(), "h".to_string())]),
+        };
+        stale.save(&a.state).unwrap();
+
+        let summary = sync(&a, "new", &backend);
+        assert_eq!(summary.pulled, 1, "the stale cursor skipped a change");
+        assert_eq!(get(&a, "new", "k").as_deref(), Some("v"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn forget_drops_the_remote_vault() {
+        let dir = root("forget");
+        let backend = Memory::default();
+        let a = device(&dir, "a", "pw");
+        init(&a, "pw");
+        set(&a, "pw", "k", "v");
+        sync(&a, "pw", &backend);
+        assert!(!backend.rows(&a.key.vault_id()).is_empty());
+
+        backend.forget(&a.key.vault_id()).unwrap();
+        assert!(backend.rows(&a.key.vault_id()).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A machine still on the retired key must not repopulate the vault another
+    /// machine just rotated away from, and must not touch its local vault.
+    #[test]
+    fn a_retired_identity_cannot_sync() {
+        let dir = root("retired");
+        let backend = Memory::default();
+        let a = device(&dir, "a", "old");
+        init(&a, "old");
+        set(&a, "old", "k", "v");
+        sync(&a, "old", &backend);
+
+        // What `--rotate` on another machine does to this identity.
+        backend.forget(&a.key.vault_id()).unwrap();
+        let before = std::fs::read(&a.vault).unwrap();
+
+        let err = run(&a.vault, "old", &a.key, &backend, &a.state)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("retired"), "{err}");
+        assert_eq!(std::fs::read(&a.vault).unwrap(), before, "local vault changed");
+        assert!(backend.rows(&a.key.vault_id()).is_empty(), "stale copy recreated");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

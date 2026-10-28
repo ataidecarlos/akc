@@ -92,7 +92,7 @@ A release must carry **every** asset: `--update` reads `releases/latest` and the
 downloads the file for the current platform, so a release missing one turns
 `akc --update` on that platform into a 404 rather than a no-op. For the same
 reason, `releases/latest` must only ever point at a folder holding all five.
-Partial folders are build archives: `releases/20261026_1/` currently holds
+Partial folders are build archives: `releases/20261028_1/` currently holds
 `akc-windows-aarch64.exe` (Windows ARM64) and `akc-linux-aarch64` (Linux ARM64,
 static musl); the other three arrive from builds on the other machines before
 `releases/latest` moves.
@@ -110,7 +110,14 @@ rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 ```
 
-The Linux build prefers [zig](https://ziglang.org) for cross-compiling because it needs no root and ships every musl target. `musl-tools` works too if the host can build the target directly.
+The Linux build prefers [zig](https://ziglang.org) for cross-compiling because it needs no root and ships every musl target. `musl-tools` works too if the host can build the target directly. On an aarch64 Linux host the aarch64 asset needs no cross-compiler at all:
+
+```bash
+CC_aarch64_unknown_linux_musl=gcc AR_aarch64_unknown_linux_musl=ar \
+  cargo build --release --target aarch64-unknown-linux-musl
+```
+
+This is what the Linux ARM64 asset in `releases/20261028_1/` was built with, inside WSL.
 
 ## Configuration
 
@@ -120,15 +127,16 @@ Set this up once and no command ever needs a path or a password:
 # ~/.config/akc/config
 keychain = ~/homelab/secrets.akc
 key_file = ~/.config/akc/key
+sync_url = https://akc-sync.you.workers.dev
 ```
 
 The format is `key = value`, one per line; `#` starts a comment and a leading
-`~` is expanded. It is deliberately **not** TOML — two settings do not justify a
-parser dependency, so anything fancier than `key = value` is rejected rather
-than half-understood. An unknown setting is an error rather than being silently
+`~` is expanded. It is deliberately **not** TOML — three settings do not
+justify a parser dependency, so anything fancier than `key = value` is rejected
+rather than half-understood. An unknown setting is an error rather than being silently
 ignored, and the message names the line. `AKC_CONFIG_DIR` relocates the whole
-directory, which is useful in tests. Both paths can be overridden per invocation
-with `--keychain` and `--key-file`.
+directory, which is useful in tests. All three can be overridden per invocation
+with `--keychain`, `--key-file` and `--sync-url`.
 
 The master key file is read with only its trailing newline removed, so a key
 written by `printf` behaves identically to one written by `echo`, and a key with
@@ -143,6 +151,7 @@ akc api_key                   # print the value
 akc --list                    # list key names only
 akc api_key --delete          # remove
 akc --rotate                  # re-key, keeping every secret
+akc --sync                    # pull, merge, push the online backup
 akc --update                  # check for updates
 ```
 
@@ -162,12 +171,11 @@ printf '%s' "$TOKEN" | akc api_key --set
 | `--init` | create an empty keychain |
 | `--rotate` | re-key under a new master key |
 | `--sync` | pull, merge, and push changes with the sync server |
-| `--sync-init` | create a sync vault and print its token |
-| `--sync-join TOKEN` | adopt an existing sync vault on this machine |
 | `--update` | check for and install updates |
 | `--json` | machine-readable output for reads |
 | `--keychain PATH` | override the configured keychain |
 | `--key-file PATH` | override the configured key file |
+| `--sync-url URL` | override the configured sync server |
 | `--password PW` | literal master key, for one-off scripted use |
 | `--new-password PW` | replacement key for `--init` / `--rotate` |
 | `--new-key-file PATH` | replacement key file for `--init` / `--rotate` |
@@ -296,37 +304,42 @@ deployment is in [`worker/README.md`](worker/README.md), and the whole server is
 around a hundred lines.
 
 ```bash
-# First machine: create the vault key and print the only copy of the token
-akc --sync-init --sync-url https://akc-sync.you.workers.dev
+# Every machine, including the first: name the server once
+#   ~/.config/akc/config
+#   sync_url = https://akc-sync.you.workers.dev
 
-# Every other machine: adopt the token
-akc --sync-join 'akcsync://akc-sync.you.workers.dev#<64 hex chars>'
-
-# Exchange changes (pull, merge, push)
-akc --sync
+akc --sync      # pull, merge, push
 ```
+
+**There is no second secret.** The sync identity is derived from the master
+password (or key file), so the same thing that opens the vault opens its online
+backup. A new machine needs the password, the `sync_url`, and a `keychain` path
+in the config; `akc --sync` then downloads the vault and creates the local file.
+If nothing exists under that password, it says so instead of creating an empty
+vault, so a typo cannot become a silent empty backup.
 
 The vault file stays exactly what it was: sync decrypts it in memory, merges,
 and saves it again. `--sync` is explicit, so no command ever blocks on the
 network; run it when you want, or from a scheduled task.
 
-- **The token is the vault.** `--sync-init` derives the encryption key, the item
-  ids, and the bearer token from one 32-byte secret. It is printed once and
-  never uploaded in a recoverable form. Lose it and the synced copy is
-  unreadable; the local vault is unaffected.
 - **The server learns nothing.** Entries are AES-256-GCM blobs keyed by a PRF of
   the secret name. The server sees sizes, timestamps, and how often you sync.
-- **Rotation stays local.** `--rotate` changes only the vault password. The sync
-  key is independent, so no re-upload and no other device is disturbed.
+- **One password means one identity.** That is what makes the backup reachable
+  with nothing else. The tradeoff is that a server holding the entry ids holds a
+  password verifier; Argon2id (64 MiB, t=3) is what keeps guessing expensive.
+- **Rotation re-publishes.** `--rotate` uploads the vault under the new key,
+  then deletes the copy the retired key opened. The retired password stops
+  opening the online backup. A machine still on the old key is refused (the
+  server keeps a retired marker) instead of silently recreating a stale copy,
+  and tells you to rotate there too.
 - **Conflicts lose nothing.** If the same secret changed on two machines, the
   server's value keeps the name and the other is kept as
   `name (conflict <date>)`. Both machines converge on the same winner.
 - **Deletes propagate as tombstones** and are kept forever: they are a few dozen
   bytes, and a machine that was offline for months still converges.
 
-The sync credential lives in `~/.config/akc/sync-key` (0600) by default, or in
-`AKC_SYNC_KEY`. The cursor and hashes live beside it in `sync-state.json`. Use
-`sync_key_file` in the config to move the key.
+Only `~/.config/akc/sync-state.json` (a cursor and keyed value hashes) lives on
+the machine; it is discarded automatically when the sync identity changes.
 
 ### Upgrade
 

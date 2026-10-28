@@ -20,7 +20,7 @@ export default {
     if (url.pathname === '/health') {
       return json({ ok: true });
     }
-    if (url.pathname !== '/v1/sync' || request.method !== 'POST') {
+    if (url.pathname !== '/v1/sync') {
       return json({ error: 'not found' }, 404);
     }
 
@@ -29,6 +29,28 @@ export default {
       return json({ error: 'unauthorized' }, 401);
     }
     const vault = (await sha256hex(token)).slice(0, 32);
+
+    // Rotation retires the identity, and with it the ciphertext it opened. The
+    // marker stays behind so a machine still on the old key cannot repopulate
+    // the retired vault with stale data.
+    if (request.method === 'DELETE') {
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM items WHERE vault = ?').bind(vault),
+        env.DB.prepare(
+          'INSERT INTO vaults (vault, superseded) VALUES (?, 1) ON CONFLICT (vault) DO UPDATE SET superseded = 1',
+        ).bind(vault),
+      ]);
+      return json({ ok: true });
+    }
+    const retired = await env.DB.prepare('SELECT superseded FROM vaults WHERE vault = ?')
+      .bind(vault)
+      .first();
+    if (retired?.superseded) {
+      return json({ error: 'vault superseded by a key rotation' }, 410);
+    }
+    if (request.method !== 'POST') {
+      return json({ error: 'not found' }, 404);
+    }
 
     const text = await request.text();
     if (text.length > MAX_BODY) {

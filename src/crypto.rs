@@ -114,6 +114,30 @@ fn derive_key(password: &str, salt: &[u8], params: &KdfParams) -> anyhow::Result
     Ok(key)
 }
 
+/// Fixed salt for the sync identity.
+///
+/// It is fixed because that is the whole point: the sync key must be derivable
+/// from the master password alone, so a new machine needs nothing but the
+/// password and the server URL. The cost is that the same password yields the
+/// same identity everywhere, which makes a server that stores its hash a
+/// password verifier; Argon2id is what keeps guessing expensive.
+const SYNC_SALT: &[u8] = b"akc-sync-identity-v1";
+
+/// The 32 bytes the sync key hierarchy grows from.
+pub fn derive_sync_key(password: &str) -> anyhow::Result<[u8; KEY_LEN]> {
+    derive_key(password, SYNC_SALT, &KdfParams::DEFAULT)
+}
+
+/// Cheap-cost variant for tests, where the real 64 MiB derivation would
+/// dominate the runtime.
+#[cfg(test)]
+pub(crate) fn derive_sync_key_with(
+    password: &str,
+    params: KdfParams,
+) -> anyhow::Result<[u8; KEY_LEN]> {
+    derive_key(password, SYNC_SALT, &params)
+}
+
 fn make_cipher(key: &mut [u8; KEY_LEN]) -> Aes256Gcm {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     key.zeroize();
@@ -300,6 +324,23 @@ mod tests {
     #[test]
     fn truncated_file_fails() {
         assert!(decrypt_payload(&[0u8; 10], "pass").is_err());
+    }
+
+    /// One password must name the same sync vault on every machine, from a
+    /// fresh install that has never seen the vault file.
+    #[test]
+    fn the_sync_key_depends_only_on_the_password() {
+        let params = KdfParams {
+            m_cost: MIN_M_COST,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        let a = derive_sync_key_with("pass", params).unwrap();
+        let b = derive_sync_key_with("pass", params).unwrap();
+        let other = derive_sync_key_with("other", params).unwrap();
+        assert_eq!(a, b);
+        assert_ne!(a, other);
+        assert_ne!(a, [0u8; KEY_LEN]);
     }
 
     #[test]

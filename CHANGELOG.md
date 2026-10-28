@@ -9,16 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`--sync`, `--sync-init`, `--sync-join`.** Optional encrypted sync through a
-  server that only stores ciphertext. One Cloudflare Worker and one D1 database
-  deploy in minutes on the free plan; the server code is in `worker/`.
-- **`sync_key_file`** (default `~/.config/akc/sync-key`) and `AKC_SYNC_KEY`, so a
-  machine can sync without a config entry.
+- **`--sync`.** Optional encrypted sync through a server that only stores
+  ciphertext. One Cloudflare Worker and one D1 database deploy in minutes on the
+  free plan; the server code is in `worker/`.
+- **`sync_url`** in the config, overridable with `--sync-url` or `AKC_SYNC_URL`.
 
 The vault format is unchanged: sync decrypts the current container in memory,
 merges per-secret changes, and saves it again, so existing vaults need no
-migration. A sync credential is independent of the master key, which keeps
-`--rotate` local and free.
+migration. The sync identity is derived from the master key, so there is no
+second secret to copy between machines: the password that opens the vault opens
+its online backup, and a new machine joins with only the password and the server
+URL. A consequence is that `--rotate` changes the identity: it deletes the copy
+the retired password opened and re-uploads the vault under the new key.
+
+The Worker gained `DELETE /v1/sync` for that deletion and a `vaults` marker
+table: a machine still on the retired key gets `410 Gone` instead of recreating
+a stale copy. Rerun `worker/schema.sql` and `wrangler deploy` before rotating on
+a machine that syncs.
 
 ## [4.0.0] - 2026-10-15
 

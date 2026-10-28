@@ -10,3 +10,11 @@ CREATE TABLE IF NOT EXISTS items (
 );
 
 CREATE INDEX IF NOT EXISTS items_by_seq ON items (vault, seq);
+
+-- A retired identity. `--rotate` deletes the ciphertext the previous master key
+-- opened and leaves this marker, so a machine still holding that key is told to
+-- rotate instead of repopulating a stale copy.
+CREATE TABLE IF NOT EXISTS vaults (
+  vault TEXT PRIMARY KEY,
+  superseded INTEGER NOT NULL DEFAULT 0
+);

@@ -14,7 +14,9 @@ use zeroize::Zeroizing;
 pub struct Config {
     pub keychain: Option<PathBuf>,
     pub key_file: Option<PathBuf>,
-    pub sync_key_file: Option<PathBuf>,
+    /// Sync server URL. There is no credential beside it: the sync identity is
+    /// derived from the master key.
+    pub sync_url: Option<String>,
 }
 
 impl Config {
@@ -52,11 +54,11 @@ impl Config {
                 .with_context(|| format!("{}: expected `key = value`", at()))?;
             // Quotes are optional, so both `keychain = "~/v.akc"` and
             // `keychain = ~/v.akc` work.
-            let value = expand(value.trim().trim_matches('"'));
+            let value = value.trim().trim_matches('"');
             match key.trim() {
-                "keychain" => config.keychain = Some(value),
-                "key_file" => config.key_file = Some(value),
-                "sync_key_file" => config.sync_key_file = Some(value),
+                "keychain" => config.keychain = Some(expand(value)),
+                "key_file" => config.key_file = Some(expand(value)),
+                "sync_url" => config.sync_url = Some(value.to_string()),
                 other => bail!("{}: unknown setting `{other}`", at()),
             }
         }
@@ -90,11 +92,6 @@ pub fn config_path() -> Option<PathBuf> {
 /// The key file used when nothing else names one.
 pub fn default_key_file() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("key"))
-}
-
-/// The sync credential used when nothing else names one.
-pub fn default_sync_key_file() -> Option<PathBuf> {
-    config_dir().map(|dir| dir.join("sync-key"))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -174,13 +171,12 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_sync_key_file() {
-        let Some(home) = home_dir() else { return };
-        let path = write_config("sync_key_file = ~/.config/akc/sync-key\n");
+    fn reads_the_sync_url_without_expanding_it() {
+        let path = write_config("sync_url = https://akc-sync.example.workers.dev\n");
         let config = Config::load_from(&path).unwrap();
         assert_eq!(
-            config.sync_key_file,
-            Some(home.join(".config/akc/sync-key"))
+            config.sync_url.as_deref(),
+            Some("https://akc-sync.example.workers.dev")
         );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

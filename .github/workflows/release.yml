@@ -1,0 +1,131 @@
+name: release
+
+# Builds every release asset on GitHub-hosted runners and attaches them to a
+# release. `akc --update` reads the GitHub Releases API, so this workflow -- not
+# the repository -- is the source of truth for published binaries.
+#
+# Run it by hand to (re)build an existing tag:
+#   gh workflow run release.yml -f tag=v4.1.0
+# or by pushing a tag (the release is created if it does not exist yet).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to upload the assets to
+        required: true
+        default: v4.1.0
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add musl targets
+        run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      # The script prefers zig, which is what lets one x64 host build the
+      # aarch64-musl asset without a cross toolchain. Download it here rather
+      # than pulling in a third-party action; verify the published checksum.
+      - name: Install zig
+        run: |
+          set -euo pipefail
+          ZV=0.14.1
+          curl -fsSL https://ziglang.org/download/index.json -o "$RUNNER_TEMP/zig-index.json"
+          URL=$(python3 -c "import json;print(json.load(open('$RUNNER_TEMP/zig-index.json'))['$ZV']['x86_64-linux']['tarball'])")
+          SHA=$(python3 -c "import json;print(json.load(open('$RUNNER_TEMP/zig-index.json'))['$ZV']['x86_64-linux']['shasum'])")
+          curl -fsSL "$URL" -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "$SHA  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Build Linux assets
+        run: ./scripts/build-release.sh target/release-dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: target/release-dist/*
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add MSVC targets
+        run: rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+
+      - name: Build Windows assets
+        shell: pwsh
+        run: ./scripts/build-release.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: target/release-dist/*
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build macOS asset
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          mkdir -p target/release-dist
+          cp target/aarch64-apple-darwin/release/akc target/release-dist/akc-macos-aarch64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: target/release-dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check every asset is present
+        run: |
+          set -euo pipefail
+          for f in akc-linux-x86_64 akc-linux-aarch64 akc-windows-x86_64.exe \
+                   akc-windows-aarch64.exe akc-macos-aarch64; do
+            test -s "dist/$f" || { echo "missing dist/$f"; exit 1; }
+          done
+          ls -l dist
+
+      - name: Write checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum akc-linux-x86_64 akc-linux-aarch64 akc-windows-x86_64.exe \
+                    akc-windows-aarch64.exe akc-macos-aarch64 > checksums.txt
+          cat checksums.txt
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" > /dev/null 2>&1 || \
+            gh release create "$TAG" --title "akc ${TAG#v}" --generate-notes
+          gh release upload "$TAG" dist/* --clobber
+          gh release edit "$TAG" --latest

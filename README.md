@@ -24,11 +24,11 @@ Release assets are named for the platform they target. Only ARM64 is published:
 
 | Asset | Platform |
 |---|---|
+| `akc-windows-x86_64.exe` | Windows x64 |
 | `akc-windows-aarch64.exe` | Windows ARM64 |
+| `akc-linux-x86_64` | Linux x86_64 (static, musl) |
 | `akc-linux-aarch64` | Linux ARM64 (static, musl) |
-
-Windows x64, Linux x86_64, and macOS have no published asset. Building from
-source is the way to run akc there.
+| `akc-macos-aarch64` | macOS Apple Silicon |
 
 **Windows:**
 ```powershell
@@ -45,8 +45,7 @@ sudo mv akc-linux-aarch64 /usr/local/bin/akc
 akc --version
 ```
 
-The installed binary can be named `akc` regardless of the asset name. The same
-files are mirrored in [releases/latest/](releases/latest/).
+The installed binary can be named `akc` regardless of the asset name.
 
 ### Build from Source
 
@@ -81,10 +80,11 @@ ZIG=/path/to/zig ./scripts/build-release.sh
 
 `akc --update` reads the GitHub Releases API and then downloads the asset for the
 current platform, so a release missing one turns `akc --update` on that platform
-into a 404 rather than a no-op. This release publishes ARM64 only:
-`releases/20261029_1/` holds `akc-windows-aarch64.exe` (Windows ARM64) and
-`akc-linux-aarch64` (Linux ARM64, static musl), mirrored in
-`releases/latest/`. There are no x86_64 or macOS assets.
+into a 404 rather than a no-op. `.github/workflows/release.yml` builds all five
+assets on GitHub-hosted runners (`ubuntu-latest`, `windows-latest`,
+`macos-latest`), writes `checksums.txt`, and attaches them to the release; run
+it from the Actions tab, or push a `v*` tag. Nothing is archived in the
+repository, so the GitHub release is the only copy of a binary.
 
 Then produce the checksum file:
 
@@ -106,7 +106,7 @@ CC_aarch64_unknown_linux_musl=gcc AR_aarch64_unknown_linux_musl=ar \
   cargo build --release --target aarch64-unknown-linux-musl
 ```
 
-This is what the Linux ARM64 asset in `releases/20261029_1/` was built with, inside WSL.
+The release workflow builds the Linux assets this way on `ubuntu-latest`.
 
 ## Configuration
 
@@ -360,6 +360,6 @@ itself.
 
 - **Source code:** `src/`
 - **Testing:** See [test/README.md](test/README.md)
-- **Releases:** `releases/` (the current release and a `latest` mirror)
+- **Releases:** the [GitHub releases page](https://github.com/ataidecarlos/akc/releases), built by `.github/workflows/release.yml`
 - **Changelog:** [CHANGELOG.md](CHANGELOG.md)
-- **Checksums:** `cargo run --example generate_checksums -- releases/<dir>`
+- **Checksums:** `cargo run --example generate_checksums -- <build-dir>`

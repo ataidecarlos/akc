@@ -1,126 +1,69 @@
-# akc — 20261015_1
+# akc — 4.1.0 (20261029_1)
 
-**Release Date:** 2026-10-15
-**Version:** 4.0.0
+**Release Date:** 2026-10-29
+**Version:** 4.1.0
 
-## What's New
+This is the only published release. Older releases and build archives have been
+removed from the repository and from GitHub.
 
-This release redesigns the command line around a single idea: **fetching a secret
-should need nothing but the secret's name.** Set up a config file once and `akc
-NAME` works from any process, on any machine, with no path and no password
-prompt — which is what makes it usable by an AI agent.
+## Assets
 
-- **`akc NAME` reads a secret.** Every command is now a flag and the bare
-  positional is only ever a secret name, so a secret can never collide with a
-  command word.
-- **A config file at `~/.config/akc/config`** naming the keychain and the master
-  key file. Override per-invocation with `--keychain` and `--key-file`.
-- **Master key files.** `--key-file`, `AKC_KEY_FILE`, or `~/.config/akc/key`. Only
-  the trailing newline is stripped, so a key written by `printf` behaves
-  identically to one written by `echo`.
-- **`--set` reads the value from stdin** when no value is given, so a secret never
-  appears in `argv` where any local process could read it from `ps`.
-- **`--rotate`** replaces `change-password`. The vault is one blob, so this is a
-  single re-encrypt, not a loop over secrets — the same cost for one key or a
-  thousand.
-- **`--json`** for reads, and reading several names at once costs one key
-  derivation rather than one each.
-- **macOS (Apple Silicon) is now a published platform.** Previously the only way
-  to run akc on a Mac was to build it.
-- **Concurrent writes no longer lose secrets.** Every write takes an exclusive
-  lock on `<vault>.lock` and reloads inside it. Before this, ten concurrent
-  writes left one key standing.
-- **`scripts/akc-git.sh`** wraps an akc command with the pull-before-write,
-  push-after sequence a vault committed to git needs.
+Only ARM64 is published:
 
-## Upgrade notes (breaking)
-
-The command line changed completely. Every existing invocation needs rewriting:
-
-| 3.x | 4.0.0 |
-|---|---|
-| `akc secrets.akc get NAME` | `akc --keychain secrets.akc NAME` |
-| `akc secrets.akc set NAME VALUE` | `akc --keychain secrets.akc NAME --set VALUE` |
-| `akc secrets.akc list` | `akc --keychain secrets.akc --list` |
-| `akc secrets.akc delete NAME` | `akc --keychain secrets.akc NAME --delete` |
-| `akc secrets.akc init` | `akc --keychain secrets.akc --init` |
-| `akc secrets.akc change-password` | `akc --keychain secrets.akc --rotate` |
-| `akc upgrade --version X` | `akc --update --to X` |
-| `akc secrets.akc` (interactive) | removed |
-
-Put the keychain and key paths in `~/.config/akc/config` and every `--keychain`
-above disappears.
-
-Interactive mode is gone: the flag-based syntax does not translate to a
-line-oriented REPL, and the tool is built for agents. `--init --force` remains the
-way to discard a vault.
-
-**Existing keychains need no migration.** The container format is unchanged —
-only the command line moved. macOS users had no binary before this release, so
-for them it is a first install rather than an upgrade.
-
-## Features
-
-- **One job:** fetch a secret by name, with no prompt and no arguments
-- **Strong encryption:** AES-256-GCM with Argon2id (64 MiB, t=3, p=4)
-- **Portable:** single encrypted file, safe for cloud sync and safe to commit
-- **Small:** ~1.8–2.5 MB static binary, no runtime dependencies
-- **Agent-friendly:** a key file plus a config file is all an agent needs
-- **Secure:** GCM authentication on a wrong key, tamper detection, range-checked
-  header parameters, memory zeroization, and a write lock against lost updates
-
-## Platforms
-
-Assets are named for the platform they target. Pick the one matching your machine.
-
-**Windows:**
-- `akc-windows-x86_64.exe` — Windows x64
 - `akc-windows-aarch64.exe` — Windows ARM64
+- `akc-linux-aarch64` — Linux ARM64, static musl
 
-**Linux:**
-- `akc-linux-x86_64` — Linux x86_64 (static, musl)
-- `akc-linux-aarch64` — Linux ARM64 (static, musl)
+There is no x86_64 or macOS asset in this release. `akc --update` on those
+platforms downloads an asset by name and will fail with a 404; install those
+platforms from a build of this commit instead.
 
-**macOS:**
-- `akc-macos-aarch64` — macOS Apple Silicon
+## What's new
 
-macOS binaries are unsigned, so Gatekeeper quarantines one downloaded through a
-browser. `akc --update` writes the file directly and does not set the quarantine
-attribute; after a manual download, clear it with
-`xattr -d com.apple.quarantine /usr/local/bin/akc`.
+Sync no longer needs a second secret.
 
-## Checksums
+- **One password opens the vault and its online backup.** The sync identity
+  (bearer token, entry key, item ids) is derived from the master password with
+  Argon2id, so a new machine needs only the password and `sync_url`.
+  `akc --sync` downloads the vault and creates the local file.
+- **`--sync`, `--sync-url`.** Optional encrypted sync through a Cloudflare
+  Worker and D1 database that only stores ciphertext. Configure the server once:
 
-See `checksums.txt` for SHA256 hashes of all binaries. `akc --update` verifies the
-downloaded binary against it before installing. This protects against a corrupted
-or truncated download; it is not a signature, since the checksums are fetched from
-the same release as the binary.
+  ```text
+  # ~/.config/akc/config
+  sync_url = https://akc-sync.your-subdomain.workers.dev
+  ```
 
-## Usage
+- **`--sync-init`, `--sync-join`, `AKC_SYNC_KEY`, and the `sync-key` file are
+  gone.** There is nothing to copy between machines but the password.
+- **A typo cannot make an empty backup.** If a machine has no vault and the
+  server has nothing under that password, `--sync` fails instead of creating an
+  empty vault.
+- **Rotation re-publishes.** `--rotate` uploads under the new key, then deletes
+  the copy the retired key opened. A machine still on the old key gets
+  `410 Gone` and is told to rotate, instead of recreating a stale copy.
+- **Requires the updated Worker.** Rerun `worker/schema.sql` (it adds the
+  `vaults` marker table) and `wrangler deploy` before rotating on a machine that
+  syncs.
+
+The vault format is unchanged. Existing vaults need no migration; `--sync` is
+additive, so every earlier command behaves as before.
+
+## Verification
 
 ```bash
-akc --init                    # create an empty keychain
-akc api_key --set sk-123      # add or update
-akc api_key                   # print the value
-akc --list                    # list key names only
-akc api_key --delete          # remove
-akc --rotate                  # re-key, keeping every secret
+sha256sum -c checksums.txt        # Linux
+Get-FileHash akc-windows-aarch64.exe -Algorithm SHA256   # Windows
 ```
 
-`--set` with no value reads the secret from stdin, so it never reaches `argv`:
+Expected hashes:
 
-```bash
-printf '%s' "$TOKEN" | akc api_key --set
+```text
+9f8df531fde46cf0b6176f0e2aa32eb569b70d3c289f828501ea13fdb6b54221  akc-linux-aarch64
+43d65a5d65c7c937f9fcfad302fa829c559ffa690dd58f23e66e8460b49e6338  akc-windows-aarch64.exe
 ```
 
-## Upgrade
-
-```bash
-akc --update                  # check for and install updates
-akc --update --yes            # skip the confirmation prompt
-akc --update --force          # reinstall even if already current
-akc --update --to 4.0.0       # a specific version
-```
-
-Note that `--update` on 3.x is `akc upgrade`, so upgrading *to* 4.0.0 from 3.0.0
-works with the old command; everything after uses the new one.
+Build method: Windows ARM64 with
+`cargo build --release --target aarch64-pc-windows-msvc`; Linux ARM64 built
+natively inside an aarch64 WSL Ubuntu 24.04 machine with
+`aarch64-unknown-linux-musl` and `CC_aarch64_unknown_linux_musl=gcc`. The Linux
+asset is statically linked and stripped.

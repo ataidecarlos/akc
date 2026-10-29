@@ -706,10 +706,7 @@ mod tests {
 
         fn forget(&self, vault: &str) -> Result<()> {
             self.vaults.lock().unwrap().remove(vault);
-            self.superseded
-                .lock()
-                .unwrap()
-                .insert(vault.to_string());
+            self.superseded.lock().unwrap().insert(vault.to_string());
             Ok(())
         }
     }
@@ -1131,8 +1128,15 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("retired"), "{err}");
-        assert_eq!(std::fs::read(&a.vault).unwrap(), before, "local vault changed");
-        assert!(backend.rows(&a.key.vault_id()).is_empty(), "stale copy recreated");
+        assert_eq!(
+            std::fs::read(&a.vault).unwrap(),
+            before,
+            "local vault changed"
+        );
+        assert!(
+            backend.rows(&a.key.vault_id()).is_empty(),
+            "stale copy recreated"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

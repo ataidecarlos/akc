@@ -1,2 +1,0 @@
-07ece62db9bd92794c766e42c9749cd5dad7f65decde270fb58c6b54fc34a3cd  akc-linux-aarch64
-fbbb390a0cd1c2ad9e024e266961e8a2e4f7c44b66571869d04811002a39020d  akc-windows-aarch64.exe

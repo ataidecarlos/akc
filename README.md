@@ -15,17 +15,20 @@ Keychains written by akc 1.x and 2.x (headerless `salt + nonce + ciphertext`) ar
 
 ### Download and Install
 
-Download the latest release from [releases/latest/](releases/latest/), then place the binary in a directory on your `PATH`.
+Download the latest release from the
+[GitHub releases page](https://github.com/ataidecarlos/akc/releases), then place
+the binary in a directory on your `PATH`. `akc --update` installs from the same
+page, so a manual download is only needed the first time.
 
-Release assets are named for the platform they target:
+Release assets are named for the platform they target. Only ARM64 is published:
 
 | Asset | Platform |
 |---|---|
-| `akc-windows-x86_64.exe` | Windows x64 |
 | `akc-windows-aarch64.exe` | Windows ARM64 |
-| `akc-linux-x86_64` | Linux x86_64 (static, musl) |
 | `akc-linux-aarch64` | Linux ARM64 (static, musl) |
-| `akc-macos-aarch64` | macOS Apple Silicon |
+
+Windows x64, Linux x86_64, and macOS have no published asset. Building from
+source is the way to run akc there.
 
 **Windows:**
 ```powershell
@@ -42,20 +45,8 @@ sudo mv akc-linux-aarch64 /usr/local/bin/akc
 akc --version
 ```
 
-**macOS (Apple Silicon):**
-```bash
-chmod +x akc-macos-aarch64
-sudo mv akc-macos-aarch64 /usr/local/bin/akc
-akc --version
-```
-
-Because macOS binaries are unsigned, Gatekeeper quarantines a binary that was
-downloaded through a browser. `akc --update` writes the file directly and does
-not set the quarantine attribute, so installing that way avoids it; after a
-manual download, clear it with
-`xattr -d com.apple.quarantine /usr/local/bin/akc`.
-
-The installed binary can be named `akc` regardless of the asset name. Or browse all releases in [releases/](releases/).
+The installed binary can be named `akc` regardless of the asset name. The same
+files are mirrored in [releases/latest/](releases/latest/).
 
 ### Build from Source
 
@@ -88,14 +79,12 @@ ZIG=/path/to/zig ./scripts/build-release.sh
 ./scripts/build-release-macos.sh
 ```
 
-A release must carry **every** asset: `--update` reads `releases/latest` and then
-downloads the file for the current platform, so a release missing one turns
-`akc --update` on that platform into a 404 rather than a no-op. For the same
-reason, `releases/latest` must only ever point at a folder holding all five.
-Partial folders are build archives: `releases/20261028_1/` currently holds
-`akc-windows-aarch64.exe` (Windows ARM64) and `akc-linux-aarch64` (Linux ARM64,
-static musl); the other three arrive from builds on the other machines before
-`releases/latest` moves.
+`akc --update` reads the GitHub Releases API and then downloads the asset for the
+current platform, so a release missing one turns `akc --update` on that platform
+into a 404 rather than a no-op. This release publishes ARM64 only:
+`releases/20261029_1/` holds `akc-windows-aarch64.exe` (Windows ARM64) and
+`akc-linux-aarch64` (Linux ARM64, static musl), mirrored in
+`releases/latest/`. There are no x86_64 or macOS assets.
 
 Then produce the checksum file:
 
@@ -117,7 +106,7 @@ CC_aarch64_unknown_linux_musl=gcc AR_aarch64_unknown_linux_musl=ar \
   cargo build --release --target aarch64-unknown-linux-musl
 ```
 
-This is what the Linux ARM64 asset in `releases/20261028_1/` was built with, inside WSL.
+This is what the Linux ARM64 asset in `releases/20261029_1/` was built with, inside WSL.
 
 ## Configuration
 
@@ -371,6 +360,6 @@ itself.
 
 - **Source code:** `src/`
 - **Testing:** See [test/README.md](test/README.md)
-- **Releases:** `releases/` (archive of all versions)
+- **Releases:** `releases/` (the current release and a `latest` mirror)
 - **Changelog:** [CHANGELOG.md](CHANGELOG.md)
 - **Checksums:** `cargo run --example generate_checksums -- releases/<dir>`

@@ -9,7 +9,6 @@ mod config;
 mod crypto;
 mod password;
 mod storage;
-mod sync;
 mod upgrade;
 
 use config::{Config, default_key_file, read_key_file};
@@ -26,8 +25,7 @@ use storage::{Keychain, Lock};
         "delete",
         "list",
         "rotate",
-        "update",
-        "sync"
+        "update"
     ]))
 )]
 struct Cli {
@@ -98,25 +96,11 @@ struct Cli {
     #[arg(long)]
     update: bool,
 
-    /// Pull changes from the sync server, merge them, and push local changes
-    #[arg(long)]
-    sync: bool,
-
-    /// Sync server URL (defaults to the config file)
-    #[arg(
-        long,
-        global = true,
-        env = "AKC_SYNC_URL",
-        hide_env_values = true,
-        value_name = "URL"
-    )]
-    sync_url: Option<String>,
-
     /// With --update or --init: proceed even though it discards something
     #[arg(long)]
     force: bool,
 
-    /// With --update: skip the confirmation prompt
+    /// Skip the confirmation prompt (--update, --delete)
     #[arg(long, short = 'y')]
     yes: bool,
 
@@ -134,12 +118,15 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::load()?;
 
+    // `--update` must work even when the local config is broken or stale: that
+    // is exactly when the user needs a new build. It reads nothing from it.
     if cli.update {
         ensure!(cli.names.is_empty(), "--update does not take secret names");
         return upgrade::run(cli.force, cli.yes, cli.to.as_deref());
     }
+
+    let config = Config::load()?;
 
     let file = cli.keychain.clone().or(config.keychain.clone()).context(
         "no keychain configured: set `keychain` in ~/.config/akc/config, or pass --keychain",
@@ -155,7 +142,7 @@ fn run() -> Result<()> {
     if cli.init {
         ensure!(cli.names.is_empty(), "--init does not take secret names");
         let replacement = resolve_new_key(
-            cli.new_password.as_deref().or(cli.password.as_deref()),
+            cli.new_password.as_deref(),
             cli.new_key_file
                 .as_deref()
                 .or(key_file.as_deref())
@@ -170,20 +157,7 @@ fn run() -> Result<()> {
         ensure!(cli.names.is_empty(), "--rotate does not take secret names");
         let replacement =
             resolve_new_key(cli.new_password.as_deref(), cli.new_key_file.as_deref())?;
-        return cmd_rotate(
-            &file,
-            &password,
-            &replacement,
-            resolve_sync_url(cli.sync_url.as_deref(), &config).as_deref(),
-        );
-    }
-    if cli.sync {
-        ensure!(cli.names.is_empty(), "--sync does not take secret names");
-        let url = resolve_sync_url(cli.sync_url.as_deref(), &config).context(
-            "no sync server configured: set `sync_url` in ~/.config/akc/config, \
-             or pass --sync-url",
-        )?;
-        return cmd_sync(&file, &password, &url);
+        return cmd_rotate(&file, &password, &replacement);
     }
     if cli.list {
         return cmd_list(&file, &password, &cli.names, cli.json);
@@ -195,7 +169,7 @@ fn run() -> Result<()> {
         return cmd_set(&file, name, value.as_deref(), &password);
     }
     if cli.delete {
-        return cmd_delete(&file, &password, &cli.names);
+        return cmd_delete(&file, &password, &cli.names, cli.yes);
     }
     cmd_get(&file, &password, &cli.names, cli.json)
 }
@@ -232,7 +206,7 @@ fn resolve_key(
         return read_key_file(&path);
     }
 
-    password::read_password(None, false)
+    password::read_password(false)
 }
 
 /// Resolve the replacement key for `--init` and `--rotate`.
@@ -250,7 +224,7 @@ fn resolve_new_key(password: Option<&str>, key_file: Option<&Path>) -> Result<Ze
         ensure!(path.exists(), "new key file not found: {}", path.display());
         return read_key_file(path);
     }
-    password::read_password(None, true)
+    password::read_password(true)
 }
 
 /// Normalize a secret value.
@@ -332,57 +306,11 @@ fn cmd_init(file: &Path, force: bool, password: &str) -> Result<()> {
 ///
 /// Note what this cannot do: if the vault is committed to git, the old key
 /// still opens every commit made before the rotation.
-fn cmd_rotate(file: &Path, current: &str, replacement: &str, sync_url: Option<&str>) -> Result<()> {
+fn cmd_rotate(file: &Path, current: &str, replacement: &str) -> Result<()> {
     ensure!(file.exists(), "keychain not found: {}", file.display());
-    let lock = Lock::acquire(file)?;
+    let _lock = Lock::acquire(file)?;
     let kc = Keychain::load(file, current)?;
-    rekey(file, &kc, replacement, &mut std::io::stdout())?;
-    // `sync::run` takes this lock itself; holding it here would deadlock.
-    drop(lock);
-
-    // The sync identity is derived from the master key, so a rotation changes
-    // it. The copy the retired key opened must go -- otherwise the password the
-    // user just retired still decrypts an online copy -- and the vault must be
-    // published again under the new identity.
-    if let Some(url) = sync_url {
-        match republish_sync(file, current, replacement, url) {
-            Ok(note) => println!("{note}"),
-            Err(err) => eprintln!(
-                "warning: the synced copy was not republished: {err:#}\n         \
-                 run `akc --sync` to publish the vault under the new key"
-            ),
-        }
-    }
-    Ok(())
-}
-
-/// Replace the remote vault the old key opened with one the new key opens.
-fn republish_sync(
-    file: &Path,
-    old_password: &str,
-    new_password: &str,
-    url: &str,
-) -> Result<String> {
-    use sync::Backend as _;
-    let new = sync::SyncKey::from_master(new_password, url)?;
-    let summary = sync::run(
-        file,
-        new_password,
-        &new,
-        &sync::HttpBackend::new(&new)?,
-        &sync::default_state_path()?,
-    )?;
-    // Delete only after the new copy is up, so a failed upload cannot leave the
-    // vault with no online copy at all.
-    let forgotten = sync::SyncKey::from_master(old_password, url)
-        .and_then(|old| sync::HttpBackend::new(&old)?.forget(&old.vault_id()));
-    let mut note = format!("Re-uploaded the synced copy under the new key ({summary})");
-    if let Err(err) = forgotten {
-        note.push_str(&format!(
-            "\nwarning: the copy under the previous key could not be deleted: {err:#}"
-        ));
-    }
-    Ok(note)
+    rekey(file, &kc, replacement, &mut std::io::stdout())
 }
 
 /// Back up the vault, then rewrite it under `new_password`.
@@ -399,10 +327,10 @@ fn rekey(file: &Path, kc: &Keychain, new_password: &str, out: &mut impl Write) -
 /// Store a secret. `value` is `None` when the flag was given with nothing after
 /// it, which is the signal to read the secret from stdin instead of argv.
 fn cmd_set(file: &Path, name: &str, value: Option<&str>, password: &str) -> Result<()> {
-    let raw = match value {
+    let raw = Zeroizing::new(match value {
         Some(value) => value.to_string(),
         None => read_value()?,
-    };
+    });
     let value = normalize_value(&raw)?;
     mutate(file, password, |kc| {
         kc.set(name, value);
@@ -465,8 +393,11 @@ fn cmd_list(file: &Path, password: &str, names: &[String], json: bool) -> Result
 
 /// Remove one or more secrets. All or nothing: if any name is missing, nothing
 /// is written.
-fn cmd_delete(file: &Path, password: &str, names: &[String]) -> Result<()> {
+fn cmd_delete(file: &Path, password: &str, names: &[String], yes: bool) -> Result<()> {
     ensure!(!names.is_empty(), "no secret name given");
+    if !yes {
+        confirm_delete(names)?;
+    }
     mutate(file, password, |kc| {
         for name in names {
             ensure!(kc.delete(name), "key not found: {name}");
@@ -476,17 +407,23 @@ fn cmd_delete(file: &Path, password: &str, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The sync server URL. The environment and flag win over the config.
-fn resolve_sync_url(flag: Option<&str>, config: &Config) -> Option<String> {
-    flag.map(str::to_string).or_else(|| config.sync_url.clone())
-}
-
-fn cmd_sync(file: &Path, password: &str, url: &str) -> Result<()> {
-    let key = sync::SyncKey::from_master(password, url)?;
-    let backend = sync::HttpBackend::new(&key)?;
-    let state = sync::default_state_path()?;
-    let summary = sync::run(file, password, &key, &backend, &state)?;
-    println!("{summary}");
+/// Ask before destroying secrets, but only on a terminal.
+///
+/// A script or agent has no terminal on stdin, so it is never blocked by a
+/// question that can never be answered; `--yes` covers the case of a human
+/// running under a wrapper that does have one.
+fn confirm_delete(names: &[String]) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+    print!("Delete {}? [y/N] ", names.join(", "));
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    ensure!(
+        answer.trim().eq_ignore_ascii_case("y"),
+        "cancelled; nothing was deleted"
+    );
     Ok(())
 }
 
@@ -605,7 +542,9 @@ mod tests {
 
         // A value of "   " is whitespace, not the empty-string signal that
         // means "read stdin", so it must be rejected rather than prompt.
-        let err = cmd_set(&file, "k", Some("   "), "pw").unwrap_err().to_string();
+        let err = cmd_set(&file, "k", Some("   "), "pw")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("must not be empty"), "{err}");
 
         let kc = Keychain::load(&file, "pw").unwrap();
@@ -674,7 +613,7 @@ mod tests {
         cmd_set(&file, "a", Some("1"), "pw").unwrap();
         cmd_set(&file, "b", Some("2"), "pw").unwrap();
 
-        cmd_delete(&file, "pw", &["a".to_string()]).unwrap();
+        cmd_delete(&file, "pw", &["a".to_string()], true).unwrap();
         let kc = Keychain::load(&file, "pw").unwrap();
         assert_eq!(kc.keys(), vec!["b"]);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -688,7 +627,9 @@ mod tests {
         cmd_set(&file, "keep", Some("me"), "pw").unwrap();
 
         let names = vec!["keep".to_string(), "absent".to_string()];
-        let err = cmd_delete(&file, "pw", &names).unwrap_err().to_string();
+        let err = cmd_delete(&file, "pw", &names, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("key not found: absent"), "{err}");
 
         // All or nothing: the name that did exist must still be there.
@@ -756,7 +697,7 @@ mod tests {
         cmd_set(&file, "keep", Some("me"), "oldpass").unwrap();
         cmd_set(&file, "other", Some("value"), "oldpass").unwrap();
 
-        cmd_rotate(&file, "oldpass", "newpass", None).unwrap();
+        cmd_rotate(&file, "oldpass", "newpass").unwrap();
 
         let reloaded = Keychain::load(&file, "newpass").unwrap();
         assert_eq!(reloaded.get("keep").map(String::as_str), Some("me"));
@@ -775,7 +716,7 @@ mod tests {
         cmd_init(&file, false, "oldpass").unwrap();
         cmd_set(&file, "keep", Some("me"), "oldpass").unwrap();
 
-        let err = cmd_rotate(&file, "wrong", "newpass", None)
+        let err = cmd_rotate(&file, "wrong", "newpass")
             .unwrap_err()
             .to_string();
         assert!(err.contains("wrong password"), "{err}");
@@ -788,7 +729,7 @@ mod tests {
     #[test]
     fn rotate_requires_an_existing_keychain() {
         let dir = temp_dir();
-        let err = cmd_rotate(&dir.join("missing.akc"), "pw", "pw", None)
+        let err = cmd_rotate(&dir.join("missing.akc"), "pw", "pw")
             .unwrap_err()
             .to_string();
         assert!(err.contains("not found"), "{err}");
@@ -812,9 +753,13 @@ mod tests {
     /// leave an agent hanging on a file the user believed was configured.
     #[test]
     fn a_missing_named_key_file_is_an_error() {
-        let err = resolve_key(None, Some(Path::new("/nonexistent/key")), &Config::default())
-            .unwrap_err()
-            .to_string();
+        let err = resolve_key(
+            None,
+            Some(Path::new("/nonexistent/key")),
+            &Config::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("key file not found"), "{err}");
     }
 
@@ -827,7 +772,6 @@ mod tests {
         let config = Config {
             keychain: None,
             key_file: Some(key_path),
-            sync_url: None,
         };
         let key = resolve_key(None, None, &config).unwrap();
         assert_eq!(key.as_str(), "from-file");

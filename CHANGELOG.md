@@ -5,6 +5,48 @@ All notable changes to akc are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.0.0] - 2026-11-16
+
+akc is local-only again. The sync feature shipped in 4.1.0 is removed until it
+has had more time to stabilize; the vault format and every local command are
+unchanged.
+
+### Removed
+
+- **Cloud sync and the `worker/` server.** `--sync`, `--sync-url`, `AKC_SYNC_URL`,
+  `sync_url`, `src/sync.rs`, and the Cloudflare Worker are gone. A 4.x config
+  that still contains `sync_url` fails with a message saying to delete the line.
+  The vault file needs no migration.
+- **Local release scripts.** `scripts/build-release.ps1`,
+  `build-release.sh`, `build-release-macos.sh`, and `generate_checksums.rs` are
+  gone. `.github/workflows/release.yml` now builds all five assets natively on
+  GitHub-hosted runners, including the arm64 runners, and writes `checksums.txt`
+  there.
+- **`scripts/akc-git.sh`.** The shared-vault-in-git advice is now a short README
+  section instead of a wrapper script.
+- **The `hkdf` dependency**, which only sync used.
+
+### Added
+
+- **CI on GitHub.** `.github/workflows/ci.yml` runs the unit and integration
+  suites on Linux, macOS and Windows for every push and pull request.
+
+### Fixed
+
+- A file that starts with `AKCSTORE` but is shorter than the header panicked in
+  `read_params` instead of reporting truncation.
+- The Argon2 memory-cost cap is 256 MiB instead of 1 GiB, so a crafted header
+  cannot force a multi-gigabyte allocation.
+- `--update` has a 60-second HTTP timeout and a 64 MiB download cap, so a
+  stalled or hostile server cannot hang it or exhaust memory.
+- `--init` no longer reuses `--password` / `AKC_PASSWORD` as the new master key;
+  it uses only `--new-password`, `--new-key-file`, the configured key file, or
+  the prompt, matching the documented behavior.
+- `--delete` asks for confirmation on a terminal; `--yes` skips it. Scripts and
+  agents are never prompted because their stdin is not a terminal.
+- On Unix, a key file readable by other users produces a warning.
+- The intermediate `--set` value is zeroized.
+
 ## [4.1.0] - 2026-10-29
 
 ### Added

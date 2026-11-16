@@ -42,7 +42,9 @@ cargo test
 ./test/test.sh
 ```
 
-Both unit and integration tests must pass before any release.
+Both unit and integration tests must pass before any release. CI
+(`.github/workflows/ci.yml`) runs both suites on Linux, macOS and Windows for
+every push and pull request.
 
 ## Regression tests worth knowing about
 
@@ -74,6 +76,10 @@ failure mode is silent:
   readable and is rewritten in the current container.
 - `crypto::tests::out_of_range_params_are_rejected_before_allocating` — a hostile
   header cannot request an unbounded Argon2 allocation.
+- `crypto::tests::short_magic_prefixed_file_reports_truncation` — a half-written
+  or half-downloaded container must report truncation, not panic.
+- `config::tests::the_removed_sync_setting_explains_itself` — a 4.x config with
+  `sync_url` must say what changed instead of calling it an unknown setting.
 
 ## What's Tested
 
@@ -84,8 +90,9 @@ failure mode is silent:
   values, reads a value from stdin when none is given
 - bare `NAME` — retrieves one or more values, fails on missing keys, `--json`
 - `--list` — shows sorted keys, filters to named keys, `--json`
-- `--delete` — removes keys, fails on missing keys, all-or-nothing across several
-  names, `--drop`/`--remove`/`--rm` aliases
+- `--delete` — removes keys, asks first on a terminal (`--yes` skips), fails on
+  missing keys, all-or-nothing across several names, `--drop`/`--remove`/`--rm`
+  aliases
 - `--rotate` — keeps secrets, requires the current key, creates a backup
 
 **Key handling:**

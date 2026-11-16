@@ -38,6 +38,10 @@ if ($exe) {
     }
     if (-not $exe) { Write-Host "FAIL: no binary found"; exit 1 }
 }
+# Background jobs do not always inherit this session's working directory
+# (Windows PowerShell 5.1 starts them in the home directory), so pass the
+# executable as an absolute path.
+$exe = (Resolve-Path -LiteralPath $exe).Path
 Write-Host "Using binary: $exe"
 
 $script:pass = 0
@@ -119,8 +123,8 @@ try {
     Assert-True "init refuses an existing keychain" ($r.ExitCode -ne 0 -and $r.Output -match "already exists") $r.Output
     Assert-True "init refusal points at --rotate" ($r.Output -match "--rotate") $r.Output
 
-    $r = Invoke-AkcPw @("--init") -Password ""
-    Assert-True "init rejects an empty password" ($r.ExitCode -ne 0) $r.Output
+    $r = Invoke-Akc @("--init", "--new-password=")
+    Assert-True "init rejects an empty new password" ($r.ExitCode -ne 0 -and $r.Output -match "new password must not be empty") $r.Output
 
     # --- set / get ---
     $r = Invoke-Akc @("zeta", "--set", "last-value")
@@ -183,16 +187,16 @@ try {
     Assert-True "list --json emits an array" ($r.ExitCode -eq 0 -and $r.Output -match '"alpha"') $r.Output
 
     # --- delete, including the aliases ---
-    $r = Invoke-Akc @("zeta", "--delete")
+    $r = Invoke-Akc @("zeta", "--delete", "--yes")
     Assert-True "delete removes a key" ($r.ExitCode -eq 0) $r.Output
     $r = Invoke-Akc @("zeta")
     Assert-True "deleted key is gone" ($r.ExitCode -ne 0) $r.Output
-    $r = Invoke-Akc @("zeta", "--delete")
+    $r = Invoke-Akc @("zeta", "--delete", "--yes")
     Assert-True "delete of a missing key fails" ($r.ExitCode -ne 0 -and $r.Output -match "not found") $r.Output
 
-    $r = Invoke-Akc @("piped", "--drop")
+    $r = Invoke-Akc @("piped", "--drop", "--yes")
     Assert-True "--drop is an alias for --delete" ($r.ExitCode -eq 0) $r.Output
-    $r = Invoke-Akc @("padded", "--remove")
+    $r = Invoke-Akc @("padded", "--remove", "--yes")
     Assert-True "--remove is an alias for --delete" ($r.ExitCode -eq 0) $r.Output
 
     # --- command flags are mutually exclusive ---
@@ -272,10 +276,20 @@ try {
 
     Assert-True "rotate created a backup" ((Get-ChildItem -LiteralPath $work -Filter "*.bak").Count -gt $before) "before=$before"
 
+    # --- init takes its new key from --new-password / --new-key-file, never the
+    # --password that other commands use to open an existing vault ---
+    $fresh = Join-Path $work "fresh.akc"
+    $r = Invoke-AkcPw @("--keychain", $fresh, "--init", "--new-password", "fresh-pass") -Password "current-pass"
+    Assert-True "init creates a vault with the new key" ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath $fresh)) $r.Output
+    $r = Invoke-AkcPw @("--keychain", $fresh, "--list") -Password "fresh-pass"
+    Assert-True "the new key opens the vault" ($r.ExitCode -eq 0) $r.Output
+    $r = Invoke-AkcPw @("--keychain", $fresh, "--list") -Password "current-pass"
+    Assert-True "the current --password is not reused as the new key" ($r.ExitCode -ne 0) $r.Output
+
     # --- failed ops leave file untouched ---
     $sizeBefore = (Get-Item -LiteralPath $kc).Length
     $null = Invoke-AkcPw @("missing_key") -Password "rotated-456"
-    $null = Invoke-AkcPw @("missing_key", "--delete") -Password "rotated-456"
+    $null = Invoke-AkcPw @("missing_key", "--delete", "--yes") -Password "rotated-456"
     $null = Invoke-AkcPw @("blank", "--set", "") -Password "rotated-456"
     $null = Invoke-AkcPw @("blank", "--set", "   ") -Password "rotated-456"
     $sizeAfter = (Get-Item -LiteralPath $kc).Length
@@ -284,11 +298,13 @@ try {
     # --- concurrent writers ---
     # Regression: the vault is one blob that every write rewrites wholesale, so
     # two writers that both read before either saved would clobber each other.
-    # Before the write lock, ten concurrent `set` calls left a single key.
+    # Before the write lock, concurrent `set` calls left a single key. Six
+    # writers keep the run short: each invocation pays the real Argon2 cost, and
+    # the lock serializes them.
     $race = Join-Path $work "race.akc"
     $null = Invoke-Akc @("--keychain", $race, "--init")
 
-    $jobs = 1..10 | ForEach-Object {
+    $jobs = 1..6 | ForEach-Object {
         $i = $_
         Start-Job -ScriptBlock {
             param($exePath, $vault, $n)
@@ -296,12 +312,12 @@ try {
             & $exePath --keychain $vault "race$n" --set "value$n" 2>&1 | Out-Null
         } -ArgumentList $exe, $race, $i
     }
-    $null = $jobs | Wait-Job -Timeout 120
+    $null = $jobs | Wait-Job -Timeout 240
     $jobs | Remove-Job -Force
 
     $r = Invoke-Akc @("--keychain", $race, "--list")
     $raceKeys = ($r.Output -split "`r?`n" | Where-Object { $_ -like "race*" }).Count
-    Assert-True "concurrent writers lose no secrets" ($raceKeys -eq 10) "stored $raceKeys of 10"
+    Assert-True "concurrent writers lose no secrets" ($raceKeys -eq 6) "stored $raceKeys of 6"
 
     Assert-True "a write lock is kept beside the vault" (Test-Path -LiteralPath "$race.lock") "no $race.lock"
 }

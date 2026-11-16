@@ -14,9 +14,6 @@ use zeroize::Zeroizing;
 pub struct Config {
     pub keychain: Option<PathBuf>,
     pub key_file: Option<PathBuf>,
-    /// Sync server URL. There is no credential beside it: the sync identity is
-    /// derived from the master key.
-    pub sync_url: Option<String>,
 }
 
 impl Config {
@@ -58,7 +55,12 @@ impl Config {
             match key.trim() {
                 "keychain" => config.keychain = Some(expand(value)),
                 "key_file" => config.key_file = Some(expand(value)),
-                "sync_url" => config.sync_url = Some(value.to_string()),
+                // A 4.x config may still carry this. Say what changed rather
+                // than reporting it as an unknown setting.
+                "sync_url" => bail!(
+                    "{}: sync was removed in akc 5.0; delete the `sync_url` line",
+                    at()
+                ),
                 other => bail!("{}: unknown setting `{other}`", at()),
             }
         }
@@ -119,10 +121,30 @@ fn expand(value: &str) -> PathBuf {
 pub fn read_key_file(path: &Path) -> Result<Zeroizing<String>> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read key file {}", path.display()))?;
+    #[cfg(unix)]
+    warn_if_others_can_read(path);
     let key = raw.strip_suffix('\n').unwrap_or(&raw);
     let key = key.strip_suffix('\r').unwrap_or(key);
     ensure!(!key.is_empty(), "key file {} is empty", path.display());
     Ok(Zeroizing::new(key.to_string()))
+}
+
+/// The key file is the whole security boundary, so a mode that lets other local
+/// users read it is worth saying out loud.
+#[cfg(unix)]
+fn warn_if_others_can_read(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "warning: key file {} is readable by other users (mode {:03o}); run `chmod 600 {}`",
+                path.display(),
+                mode & 0o777,
+                path.display()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -161,9 +183,8 @@ mod tests {
 
     #[test]
     fn ignores_comments_blanks_and_quotes() {
-        let path = write_config(
-            "# a comment\n\n  keychain = \"/v.akc\"  \n\n# another\nkey_file = /k\n",
-        );
+        let path =
+            write_config("# a comment\n\n  keychain = \"/v.akc\"  \n\n# another\nkey_file = /k\n");
         let config = Config::load_from(&path).unwrap();
         assert_eq!(config.keychain, Some(PathBuf::from("/v.akc")));
         assert_eq!(config.key_file, Some(PathBuf::from("/k")));
@@ -171,13 +192,11 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_sync_url_without_expanding_it() {
-        let path = write_config("sync_url = https://akc-sync.example.workers.dev\n");
-        let config = Config::load_from(&path).unwrap();
-        assert_eq!(
-            config.sync_url.as_deref(),
-            Some("https://akc-sync.example.workers.dev")
-        );
+    fn the_removed_sync_setting_explains_itself() {
+        let path = write_config("sync_url = https://old.example\n");
+        let err = Config::load_from(&path).unwrap_err().to_string();
+        assert!(err.contains("removed in akc 5.0"), "{err}");
+        assert!(err.contains("sync_url"), "{err}");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

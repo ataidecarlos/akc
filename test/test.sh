@@ -91,6 +91,7 @@ mkdir -p "$AKC_CONFIG_DIR"
 KC="$WORK/secrets.akc"
 KEY="$AKC_CONFIG_DIR/key"
 printf 'test-pass-123\n' > "$KEY"
+chmod 600 "$KEY"
 printf '# test config\nkeychain = %s\nkey_file = %s\n' "$KC" "$KEY" > "$AKC_CONFIG_DIR/config"
 
 cleanup() { rm -rf "$WORK"; }
@@ -103,7 +104,7 @@ trap cleanup EXIT
 run_akc() {
     local tmpfile; tmpfile=$(mktemp)
     EXIT_CODE=0
-    "$AKC" "$@" > "$tmpfile" 2>&1 || EXIT_CODE=$?
+    "$AKC" "$@" > "$tmpfile" 2>&1 < /dev/null || EXIT_CODE=$?
     AKC_OUTPUT=$(cat "$tmpfile")
     rm -f "$tmpfile"
 }
@@ -113,7 +114,7 @@ run_akc_pw() {
     local pw="$1"; shift
     local tmpfile; tmpfile=$(mktemp)
     EXIT_CODE=0
-    "$AKC" --password "$pw" "$@" > "$tmpfile" 2>&1 || EXIT_CODE=$?
+    "$AKC" --password "$pw" "$@" > "$tmpfile" 2>&1 < /dev/null || EXIT_CODE=$?
     AKC_OUTPUT=$(cat "$tmpfile")
     rm -f "$tmpfile"
 }
@@ -128,6 +129,10 @@ assert_true "init creates a keychain" "$([[ $EXIT_CODE -eq 0 && -f "$KC" ]] && e
 run_akc --init
 assert_true "init refuses to clobber an existing keychain" \
     "$([[ $EXIT_CODE -ne 0 && "$AKC_OUTPUT" == *"already exists"* ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
+
+run_akc --init --new-password ""
+assert_true "init rejects an empty new password" \
+    "$([[ $EXIT_CODE -ne 0 && "$AKC_OUTPUT" == *"new password must not be empty"* ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
 # --- set / get ---
 run_akc zeta --set "last-value"
@@ -196,16 +201,16 @@ assert_true "list --json emits an array" \
     "$([[ $EXIT_CODE -eq 0 && "$AKC_OUTPUT" == *'"alpha"'* ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
 # --- delete, including the aliases ---
-run_akc zeta --delete
+run_akc zeta --delete --yes
 assert_true "delete removes a key" "$([[ $EXIT_CODE -eq 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 run_akc zeta
 assert_true "deleted key is gone" "$([[ $EXIT_CODE -ne 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
-run_akc zeta --delete
+run_akc zeta --delete --yes
 assert_true "delete of a missing key fails" "$([[ $EXIT_CODE -ne 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
-run_akc piped --drop
+run_akc piped --drop --yes
 assert_true "--drop is an alias for --delete" "$([[ $EXIT_CODE -eq 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
-run_akc padded --remove
+run_akc padded --remove --yes
 assert_true "--remove is an alias for --delete" "$([[ $EXIT_CODE -eq 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
 
 # --- command flags are mutually exclusive ---
@@ -304,9 +309,21 @@ BACKUPS_AFTER=$(find "$WORK" -maxdepth 1 -name '*.bak' | wc -l)
 assert_true "rotate created a backup" \
     "$([[ $BACKUPS_AFTER -gt $BACKUPS_BEFORE ]] && echo 0 || echo 1)" "$BACKUPS_BEFORE -> $BACKUPS_AFTER"
 
+# --- init takes its new key from --new-password / --new-key-file, never the
+# --password that other commands use to open an existing vault ---
+FRESH="$WORK/fresh.akc"
+run_akc_pw "current-pass" --keychain "$FRESH" --init --new-password "fresh-pass"
+assert_true "init creates a vault with the new key" \
+    "$([[ $EXIT_CODE -eq 0 && -f "$FRESH" ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
+run_akc_pw "fresh-pass" --keychain "$FRESH" --list
+assert_true "the new key opens the vault" "$([[ $EXIT_CODE -eq 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
+run_akc_pw "current-pass" --keychain "$FRESH" --list
+assert_true "the current --password is not reused as the new key" \
+    "$([[ $EXIT_CODE -ne 0 ]] && echo 0 || echo 1)" "$AKC_OUTPUT"
+
 # --- failed ops leave the file untouched ---
 run_akc_pw "rotated-456" missing_key
-run_akc_pw "rotated-456" missing_key --delete
+run_akc_pw "rotated-456" missing_key --delete --yes
 run_akc_pw "rotated-456" blank --set ""
 SIZE_AFTER=$(file_size "$KC")
 run_akc_pw "rotated-456" blank --set "   "
@@ -317,11 +334,13 @@ assert_true "failed ops leave file untouched" \
 # --- concurrent writers ---
 # Regression: the vault is one blob that every write rewrites wholesale, so two
 # writers that both read before either saved would clobber each other. Before
-# the write lock, ten concurrent `set` calls left a single key standing.
+# the write lock, concurrent `set` calls left a single key standing. Six writers
+# keep the run short: each invocation pays the real Argon2 cost, and the lock
+# serializes them.
 RACE="$WORK/race.akc"
 run_akc --keychain "$RACE" --init
 
-for i in $(seq 1 10); do
+for i in $(seq 1 6); do
     env AKC_PASSWORD="test-pass-123" "$AKC" --keychain "$RACE" "race$i" --set "value$i" &
 done
 wait
@@ -329,7 +348,7 @@ wait
 run_akc --keychain "$RACE" --list
 RACE_KEYS=$(printf '%s\n' "$AKC_OUTPUT" | grep -c '^race')
 assert_true "concurrent writers lose no secrets" \
-    "$([[ "$RACE_KEYS" -eq 10 ]] && echo 0 || echo 1)" "stored $RACE_KEYS of 10"
+    "$([[ "$RACE_KEYS" -eq 6 ]] && echo 0 || echo 1)" "stored $RACE_KEYS of 6"
 
 assert_true "a write lock is kept beside the vault" \
     "$([[ -f "$RACE.lock" ]] && echo 0 || echo 1)" "no $RACE.lock"

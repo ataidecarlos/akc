@@ -1,12 +1,17 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::Client;
 use semver::Version;
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const GITHUB_OWNER: &str = "ataidecarlos";
 const GITHUB_REPO: &str = "akc";
+
+/// A stalled or hostile server must not hang the process or exhaust memory.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_DOWNLOAD: u64 = 64 * 1024 * 1024;
 
 struct ReleaseInfo {
     version: Version,
@@ -79,6 +84,7 @@ pub fn run(force: bool, yes: bool, version: Option<&str>) -> Result<()> {
 fn make_client() -> Result<Client> {
     Client::builder()
         .user_agent(format!("akc/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(HTTP_TIMEOUT)
         .build()
         .context("failed to build HTTP client")
 }
@@ -177,7 +183,26 @@ fn asset_name_for(os: &str, arch: &str) -> Result<String> {
 fn download_file(url: &str) -> Result<Vec<u8>> {
     let client = make_client()?;
     let response = client.get(url).send()?.error_for_status()?;
-    Ok(response.bytes()?.to_vec())
+    if let Some(length) = response.content_length() {
+        ensure!(
+            length <= MAX_DOWNLOAD,
+            "download is larger than the {} MiB limit",
+            MAX_DOWNLOAD / 1024 / 1024
+        );
+    }
+    read_capped(response, MAX_DOWNLOAD)
+}
+
+/// Read at most `cap` bytes, failing instead of truncating an oversize body.
+fn read_capped(reader: impl Read, cap: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(cap + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= cap,
+        "download is larger than the {} MiB limit",
+        cap / 1024 / 1024
+    );
+    Ok(bytes)
 }
 
 fn verify_checksum(binary_data: &[u8], checksum_data: &[u8], binary_name: &str) -> Result<()> {
@@ -362,6 +387,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not found in checksums.txt"), "{err}");
+    }
+
+    #[test]
+    fn downloads_over_the_cap_are_rejected() {
+        let body = vec![0u8; 9];
+        let err = read_capped(body.as_slice(), 8).unwrap_err().to_string();
+        assert!(err.contains("larger than"), "{err}");
+        assert_eq!(read_capped(body.as_slice(), 9).unwrap().len(), 9);
     }
 
     #[test]

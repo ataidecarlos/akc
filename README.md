@@ -11,6 +11,10 @@ A minimal encrypted secret store. CLI only: no server or network listener. Singl
 
 Keychains written by akc 1.x and 2.x (headerless `salt + nonce + ciphertext`) are still readable. They are migrated to the current container automatically the first time they are written, with no action required.
 
+akc 5.0 is local-only. The encrypted sync feature added in 4.1 is removed until
+it has had another stabilization pass; if a 4.x config contains `sync_url`, akc
+now says so and asks you to delete that line. Vault files are unaffected.
+
 ## Installation
 
 ### Download and Install
@@ -20,7 +24,7 @@ Download the latest release from the
 the binary in a directory on your `PATH`. `akc --update` installs from the same
 page, so a manual download is only needed the first time.
 
-Release assets are named for the platform they target. Only ARM64 is published:
+Release assets are named for the platform they target:
 
 | Asset | Platform |
 |---|---|
@@ -49,64 +53,27 @@ The installed binary can be named `akc` regardless of the asset name.
 
 ### Build from Source
 
-```powershell
+```bash
 cargo build --release
-# Binary: target/release/akc.exe
+# Binary: target/release/akc  (target\release\akc.exe on Windows)
 ```
 
 ### Build Release Binaries
 
-Release assets are architecture-explicit, so each script builds one platform.
+All release binaries are built on GitHub-hosted runners; nothing is built or
+archived locally. The `release` workflow builds each asset natively on its own
+runner, writes `checksums.txt`, and attaches both to the GitHub release:
 
-```powershell
-# Windows (both architectures) -> target\release-dist
-.\scripts\build-release.ps1
-```
+| Runner | Target | Asset |
+|---|---|---|
+| `ubuntu-latest` | `x86_64-unknown-linux-musl` | `akc-linux-x86_64` |
+| `ubuntu-24.04-arm` | `aarch64-unknown-linux-musl` | `akc-linux-aarch64` |
+| `windows-latest` | `x86_64-pc-windows-msvc` | `akc-windows-x86_64.exe` |
+| `windows-11-arm` | `aarch64-pc-windows-msvc` | `akc-windows-aarch64.exe` |
+| `macos-latest` | `aarch64-apple-darwin` | `akc-macos-aarch64` |
 
-```bash
-# Linux (both architectures, static musl) -> target/release-dist
-# Run inside WSL. Uses zig as the musl cross-compiler when available:
-ZIG=/path/to/zig ./scripts/build-release.sh
-```
-
-```bash
-# All five assets from macOS -> target/release-dist
-# Cross-compiles the Windows and Linux binaries, so only the macOS one can be
-# run on the build host. One-time setup:
-#   brew install zig llvm && cargo install cargo-xwin cargo-zigbuild
-#   export PATH="$(brew --prefix llvm)/bin:$PATH"   # keg-only; llvm-lib
-./scripts/build-release-macos.sh
-```
-
-`akc --update` reads the GitHub Releases API and then downloads the asset for the
-current platform, so a release missing one turns `akc --update` on that platform
-into a 404 rather than a no-op. `.github/workflows/release.yml` builds all five
-assets on GitHub-hosted runners (`ubuntu-latest`, `windows-latest`,
-`macos-latest`), writes `checksums.txt`, and attaches them to the release; run
-it from the Actions tab, or push a `v*` tag. Nothing is archived in the
-repository, so the GitHub release is the only copy of a binary.
-
-Then produce the checksum file:
-
-```bash
-cargo run --example generate_checksums -- target/release-dist
-```
-
-Required Rust targets:
-
-```bash
-rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-```
-
-The Linux build prefers [zig](https://ziglang.org) for cross-compiling because it needs no root and ships every musl target. `musl-tools` works too if the host can build the target directly. On an aarch64 Linux host the aarch64 asset needs no cross-compiler at all:
-
-```bash
-CC_aarch64_unknown_linux_musl=gcc AR_aarch64_unknown_linux_musl=ar \
-  cargo build --release --target aarch64-unknown-linux-musl
-```
-
-The release workflow builds the Linux assets this way on `ubuntu-latest`.
+Run it from the Actions tab, or push a `v*` tag. The GitHub release is the only
+copy of a binary, and `akc --update` reads it through the Releases API.
 
 ## Configuration
 
@@ -116,16 +83,15 @@ Set this up once and no command ever needs a path or a password:
 # ~/.config/akc/config
 keychain = ~/homelab/secrets.akc
 key_file = ~/.config/akc/key
-sync_url = https://akc-sync.you.workers.dev
 ```
 
 The format is `key = value`, one per line; `#` starts a comment and a leading
-`~` is expanded. It is deliberately **not** TOML — three settings do not
+`~` is expanded. It is deliberately **not** TOML — two settings do not
 justify a parser dependency, so anything fancier than `key = value` is rejected
 rather than half-understood. An unknown setting is an error rather than being silently
 ignored, and the message names the line. `AKC_CONFIG_DIR` relocates the whole
-directory, which is useful in tests. All three can be overridden per invocation
-with `--keychain`, `--key-file` and `--sync-url`.
+directory, which is useful in tests. Both can be overridden per invocation
+with `--keychain` and `--key-file`.
 
 The master key file is read with only its trailing newline removed, so a key
 written by `printf` behaves identically to one written by `echo`, and a key with
@@ -140,7 +106,6 @@ akc api_key                   # print the value
 akc --list                    # list key names only
 akc api_key --delete          # remove
 akc --rotate                  # re-key, keeping every secret
-akc --sync                    # pull, merge, push the online backup
 akc --update                  # check for updates
 ```
 
@@ -156,20 +121,18 @@ printf '%s' "$TOKEN" | akc api_key --set
 | `akc NAME...` | print the value of each name, one per line |
 | `--set [VALUE]` | store NAME, overwriting it (reads stdin when VALUE is omitted) |
 | `--list [NAME...]` | list names, or only those given |
-| `--delete NAME...` | remove (aliases: `--drop`, `--remove`, `--rm`) |
+| `--delete NAME...` | remove (aliases: `--drop`, `--remove`, `--rm`); asks first on a terminal |
 | `--init` | create an empty keychain |
 | `--rotate` | re-key under a new master key |
-| `--sync` | pull, merge, and push changes with the sync server |
 | `--update` | check for and install updates |
 | `--json` | machine-readable output for reads |
 | `--keychain PATH` | override the configured keychain |
 | `--key-file PATH` | override the configured key file |
-| `--sync-url URL` | override the configured sync server |
 | `--password PW` | literal master key, for one-off scripted use |
 | `--new-password PW` | replacement key for `--init` / `--rotate` |
 | `--new-key-file PATH` | replacement key file for `--init` / `--rotate` |
 | `--force` | with `--init` / `--update`: proceed although it discards something |
-| `--yes` | with `--update`: skip the confirmation prompt |
+| `--yes` | skip the confirmation prompt (`--update`, `--delete`) |
 | `--to VERSION` | with `--update`: install a specific version |
 
 `--password`, `--keychain` and `--key-file` are global, so they may appear
@@ -197,8 +160,10 @@ through to a prompt, which would leave an agent waiting on input that never come
 `--init` and `--rotate` take a *new* key. `--new-password` / `AKC_NEW_PASSWORD`
 and `--new-key-file` name it directly; `--init` additionally falls back to the
 key file it would read anyway, so a fresh machine can be set up with the key
-already in place. `--rotate` does not fall back — rotating onto the key it is
-already using would be a no-op re-encrypt, so it asks instead.
+already in place. `--password` / `AKC_PASSWORD` are never reused as the new key,
+because that value is meant for opening an existing vault. `--rotate` does not
+fall back — rotating onto the key it is already using would be a no-op
+re-encrypt, so it asks instead.
 
 A **typed** key is asked for twice, because the confirmation is what catches a
 typo before it locks your secrets away. A key supplied by flag, file or
@@ -250,85 +215,22 @@ afterwards, and nothing earlier.
 `--rotate` and `--init --force` back the existing file up to
 `<keychain>_<YYYYMMDD_HHMMSS>.bak` before replacing it.
 
-### Team use: a shared vault in git
+### Multiple machines
 
-A keychain can be committed to a repository and shared by a team. Everyone uses
-the same master key, kept in a file outside the repository and handed over the way
-you would hand over any other shared secret.
+The vault file is portable: copy it, keep it in a synced folder, or commit it to
+a repository. Only the file moves; the master key stays on each machine.
 
-Two writers need care, because the vault is a single encrypted blob and git
-cannot merge two versions of it. `scripts/akc-git.sh` wraps the pull, write and
-push sequence so a second writer re-reads the first writer's change instead of
-colliding with it:
+If two machines write at the same time, the later writer must re-read the other
+change. The vault is a single encrypted blob that git cannot merge, so when it
+lives in a repository pull before a write and push straight after it. On one
+machine, every write takes an exclusive `<vault>.lock` and reloads the vault
+inside it, so concurrent writers cannot clobber each other. The lock file is a
+sidecar: add `*.lock` to your `.gitignore`.
 
-```bash
-scripts/akc-git.sh secrets.akc api_key --set sk-123
-scripts/akc-git.sh secrets.akc api_key
-```
-
-Two things protect a shared vault:
-
-- **A write lock.** Every write takes an exclusive lock on `<vault>.lock` and
-  reloads the vault inside it, so two writers on one machine cannot clobber each
-  other — a caller holding state it read earlier cannot save that stale copy over
-  someone else's work. The lock file is a sidecar: add `*.lock` to your
-  `.gitignore`.
-- **Pull before write, push after.** The script does this for you. Writing by
-  hand, do the same: `git pull` before the command and `git push` straight after.
-
-If two writers do collide, the script says so rather than silently picking a
-side, and prints the recovery. Nothing is lost either way: your change is still a
-commit.
-
-The shared master key is a bearer secret with no expiry. Anyone who has ever held
+A shared master key is a bearer secret with no expiry. Anyone who has ever held
 it can decrypt every secret in the repository's history, including ones deleted
 since, so handing it over cannot be taken back. Rotating it protects only what is
 written afterwards.
-
-### Cloud sync
-
-Sync keeps one vault across machines through a server that only ever sees
-ciphertext. It needs Cloudflare's free tier: one Worker and one D1 database. The
-deployment is in [`worker/README.md`](worker/README.md), and the whole server is
-around a hundred lines.
-
-```bash
-# Every machine, including the first: name the server once
-#   ~/.config/akc/config
-#   sync_url = https://akc-sync.you.workers.dev
-
-akc --sync      # pull, merge, push
-```
-
-**There is no second secret.** The sync identity is derived from the master
-password (or key file), so the same thing that opens the vault opens its online
-backup. A new machine needs the password, the `sync_url`, and a `keychain` path
-in the config; `akc --sync` then downloads the vault and creates the local file.
-If nothing exists under that password, it says so instead of creating an empty
-vault, so a typo cannot become a silent empty backup.
-
-The vault file stays exactly what it was: sync decrypts it in memory, merges,
-and saves it again. `--sync` is explicit, so no command ever blocks on the
-network; run it when you want, or from a scheduled task.
-
-- **The server learns nothing.** Entries are AES-256-GCM blobs keyed by a PRF of
-  the secret name. The server sees sizes, timestamps, and how often you sync.
-- **One password means one identity.** That is what makes the backup reachable
-  with nothing else. The tradeoff is that a server holding the entry ids holds a
-  password verifier; Argon2id (64 MiB, t=3) is what keeps guessing expensive.
-- **Rotation re-publishes.** `--rotate` uploads the vault under the new key,
-  then deletes the copy the retired key opened. The retired password stops
-  opening the online backup. A machine still on the old key is refused (the
-  server keeps a retired marker) instead of silently recreating a stale copy,
-  and tells you to rotate there too.
-- **Conflicts lose nothing.** If the same secret changed on two machines, the
-  server's value keeps the name and the other is kept as
-  `name (conflict <date>)`. Both machines converge on the same winner.
-- **Deletes propagate as tombstones** and are kept forever: they are a few dozen
-  bytes, and a machine that was offline for months still converges.
-
-Only `~/.config/akc/sync-state.json` (a cursor and keyed value hashes) lives on
-the machine; it is discarded automatically when the sync identity changes.
 
 ### Upgrade
 
@@ -339,12 +241,14 @@ akc --update --force          # install even if already current
 akc --update --to 1.0.0       # install a specific version
 ```
 
-Each release includes a `checksums.txt` file with SHA256 hashes, and akc verifies the downloaded binary against it before installing. This protects against a corrupted or truncated download. It is not a signature: `checksums.txt` is fetched from the same release as the binary, so it cannot protect against a compromised release.
+Each release includes a `checksums.txt` file with SHA256 hashes, and akc verifies the downloaded binary against it before installing. This protects against a corrupted or truncated download. It is not a signature: `checksums.txt` is fetched from the same release as the binary, so it cannot protect against a compromised release. The updater has a 60-second HTTP timeout and refuses a download over 64 MiB.
 
 ## Security
 
 - Wrong key fails via GCM authentication; truncated or tampered files are rejected.
-- Argon2 parameters read from a file header are range-checked before use, so a hostile file cannot request an enormous allocation.
+- Argon2 parameters read from a file header are range-checked before use; the
+  memory cost is capped at 256 MiB, so a hostile file cannot request an enormous
+  allocation.
 - Writes go to a temp file in the same directory, then atomically replace the target. Re-initialization backs up the existing file first.
 - Secret material is zeroized from memory when dropped.
 - An empty data file is 110 bytes.
@@ -359,7 +263,7 @@ itself.
 ## Development
 
 - **Source code:** `src/`
-- **Testing:** See [test/README.md](test/README.md)
-- **Releases:** the [GitHub releases page](https://github.com/ataidecarlos/akc/releases), built by `.github/workflows/release.yml`
+- **Testing:** See [test/README.md](test/README.md). CI runs the unit and
+  integration suites on Linux, macOS and Windows for every push and pull request.
+- **Releases:** the [GitHub releases page](https://github.com/ataidecarlos/akc/releases), built by `.github/workflows/release.yml` on GitHub-hosted runners
 - **Changelog:** [CHANGELOG.md](CHANGELOG.md)
-- **Checksums:** `cargo run --example generate_checksums -- <build-dir>`

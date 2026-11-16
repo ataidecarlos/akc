@@ -13,7 +13,8 @@ akc uses a two-tier testing approach:
    - Commands: each flag, and the errors it can produce
 
 2. **Integration tests** (`test/test.ps1` or `test/test.sh`) — End-to-end CLI behavior
-   - Every command (`--init`, `--set`, `--list`, `--delete`, `--rotate`, bare `NAME`)
+   - Every local command (`--init`, `--set`, `--list`, `--delete`, `--rotate`,
+     bare `NAME`); `--update` needs the network and is not covered here
    - Error cases (wrong password, missing keys, missing key file, conflicting flags)
    - Security (tamper detection, GCM authentication)
    - Portability (file copying, cross-directory usage)
@@ -53,7 +54,7 @@ failure mode is silent:
 
 - `main::tests::concurrent_writers_do_not_lose_secrets` — the vault is one blob
   rewritten wholesale, so two writers that both read before either saved would
-  clobber each other. Ten concurrent writes left one key standing.
+  clobber each other. Concurrent writes used to leave a single key standing.
 - `main::tests::mutate_reloads_before_writing` — a caller holding stale state
   must not save it over another process's write.
 - `main::tests::a_rejected_mutation_leaves_the_vault_alone` — a failed write must
@@ -106,6 +107,7 @@ failure mode is silent:
 **Config:**
 - Reads `keychain` and `key_file`, expands `~`, ignores comments and blanks
 - An unknown setting or a line without `=` is rejected with its location
+- A 4.x `sync_url` line is rejected with a message saying sync was removed
 - A missing config file is not an error
 - `--keychain` and `--key-file` override it
 

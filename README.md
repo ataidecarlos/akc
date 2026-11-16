@@ -165,10 +165,10 @@ because that value is meant for opening an existing vault. `--rotate` does not
 fall back — rotating onto the key it is already using would be a no-op
 re-encrypt, so it asks instead.
 
-A **typed** key is asked for twice, because the confirmation is what catches a
-typo before it locks your secrets away. A key supplied by flag, file or
+A **typed** new key is asked for twice, because the confirmation is what catches
+a typo before it locks your secrets away. A new key supplied by flag, file or
 environment is used as-is: it cannot contain a typo, and asking twice would break
-scripted use.
+scripted use. Opening an existing vault prompts only once.
 
 `--init` refuses to overwrite an existing keychain, so a mistyped path cannot
 silently replace a vault you already had:
@@ -251,6 +251,7 @@ Each release includes a `checksums.txt` file with SHA256 hashes, and akc verifie
   allocation.
 - Writes go to a temp file in the same directory, then atomically replace the target. Re-initialization backs up the existing file first.
 - Secret material is zeroized from memory when dropped.
+- On Unix, a key file that other users can read produces a warning.
 - An empty data file is 110 bytes.
 
 The vault file is safe to put anywhere, including a public repository — its
